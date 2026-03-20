@@ -1,1 +1,3 @@
-/target
+/target/
+*.json
+!gateway.example.json
