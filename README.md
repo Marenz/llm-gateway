@@ -25,30 +25,32 @@ cp gateway.example.json ~/.config/llm-gateway/config.json
 
 ## Authentication
 
+OAuth tokens for both Anthropic and ChatGPT are stored on disk and **auto-refreshed**
+on every request when expired — no manual re-login needed as long as the refresh token
+is valid.
+
 ### Anthropic (OAuth)
 
 ```bash
 llm-gateway login anthropic
-# opens browser → paste code#state back → tokens saved to
-# ~/.config/llm-gateway/anthropic-oauth.json
-# tokens auto-refresh on expiry
+# opens browser → paste code#state back
+# tokens saved to ~/.config/llm-gateway/anthropic-oauth.json
 ```
 
-Or set `ANTHROPIC_API_KEY` for standard API key auth.
+Or set `ANTHROPIC_API_KEY` for a standard API key instead.
 
 ### ChatGPT (subscription)
 
 ```bash
 llm-gateway login chatgpt
-# prints URL + code → visit URL → enter code → tokens saved to
-# ~/.config/llm-gateway/chatgpt-auth.json
-# tokens auto-refresh on expiry
+# opens browser at auth.openai.com → sign in → redirects back automatically
+# tokens saved to ~/.config/llm-gateway/chatgpt-auth.json
 # requires ChatGPT Plus/Pro/Max subscription
 ```
 
 ### XiaoMiMo / OpenAI
 
-Set `XIAOMI_MIMO_API_KEY` / `OPENAI_API_KEY`, or configure in `config.json`.
+Set `XIAOMI_MIMO_API_KEY` / `OPENAI_API_KEY`, or configure `api_key` in `config.json`.
 
 ## Usage
 
