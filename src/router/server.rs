@@ -729,7 +729,7 @@ impl AnthropicProvider {
             if oauth::anthropic::is_oauth_token(&api_key) {
                 request = request
                     .bearer_auth(&api_key)
-                    .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14");
+                    .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14");
             } else {
                 request = request.header("x-api-key", &api_key);
             }
@@ -756,7 +756,7 @@ impl AnthropicProvider {
         if oauth::anthropic::is_oauth_token(&api_key) {
             request = request
                 .bearer_auth(&api_key)
-                .header("anthropic-beta", "oauth-2025-04-20");
+                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14");
         } else {
             request = request.header("x-api-key", &api_key);
         }

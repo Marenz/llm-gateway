@@ -1,8 +1,11 @@
 use crate::types::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessageContent, AnthropicNamedToolChoice,
-    AnthropicRequest, AnthropicSystem, AnthropicTool, AnthropicToolChoice, AnthropicToolChoiceMode,
-    OpenAIMessage, OpenAIMessageContent, OpenAIStop, OpenAIToolChoice,
+    AnthropicRequest, AnthropicSystem, AnthropicSystemMessage, AnthropicTool, AnthropicToolChoice,
+    AnthropicToolChoiceMode, OpenAIMessage, OpenAIMessageContent, OpenAIStop, OpenAIToolChoice,
 };
+
+/// Required system prompt prefix for Anthropic OAuth tokens to unlock non-haiku models.
+const OAUTH_REQUIRED_SYSTEM: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::AnthropicRequest {
     let system = collect_system_prompt(&req.messages);
@@ -94,18 +97,28 @@ pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::Ant
 }
 
 fn collect_system_prompt(messages: &[OpenAIMessage]) -> Option<AnthropicSystem> {
-    let parts = messages
-        .iter()
-        .filter(|message| matches!(message.role, crate::types::OpenAIRole::System))
-        .map(|message| extract_text(&message.content))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>();
+    // Always prepend the required OAuth system prompt so non-haiku models work.
+    let mut blocks = vec![AnthropicSystemMessage {
+        kind: "text".to_string(),
+        text: OAUTH_REQUIRED_SYSTEM.to_string(),
+        cache_control: None,
+    }];
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(AnthropicSystem::Text(parts.join("\n\n")))
+    for message in messages
+        .iter()
+        .filter(|m| matches!(m.role, crate::types::OpenAIRole::System))
+    {
+        let text = extract_text(&message.content);
+        if !text.is_empty() {
+            blocks.push(AnthropicSystemMessage {
+                kind: "text".to_string(),
+                text,
+                cache_control: None,
+            });
+        }
     }
+
+    Some(AnthropicSystem::Messages(blocks))
 }
 
 fn translate_assistant_message(message: &OpenAIMessage) -> AnthropicMessage {
