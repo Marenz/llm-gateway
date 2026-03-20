@@ -1,0 +1,45 @@
+{
+  "host": "127.0.0.1",
+  "port": 4000,
+  "master_key": "env:LLM_GATEWAY_MASTER_KEY",
+  "log_level": "normal",
+  "providers": [
+    {
+      "type": "anthropic",
+      "name": "anthropic",
+      "api_key": "env:ANTHROPIC_API_KEY",
+      "oauth_token_file": null,
+      "api_base": "https://api.anthropic.com",
+      "allow_bearer_passthrough": false,
+      "required_system_prompt": null,
+      "models": []
+    },
+    {
+      "type": "chatgpt",
+      "name": "chatgpt",
+      "token_file": null,
+      "api_base": "https://chatgpt.com/backend-api/codex",
+      "models": []
+    },
+    {
+      "type": "openai",
+      "name": "openai",
+      "api_key": "env:OPENAI_API_KEY",
+      "api_base": "https://api.openai.com/v1",
+      "models": []
+    },
+    {
+      "type": "xiaomi_mimo",
+      "name": "xiaomi-mimo",
+      "api_key": "env:XIAOMI_MIMO_API_KEY",
+      "api_base": "https://api.xiaomimimo.com/v1",
+      "models": []
+    }
+  ],
+  "model_aliases": {
+    "claude": "claude-sonnet-4-5-20250929",
+    "claude-opus": "claude-opus-4-6-20260205",
+    "gpt-4": "chatgpt/gpt-5.4",
+    "mimo": "mimo-v2-flash"
+  }
+}

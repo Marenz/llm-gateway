@@ -2,5 +2,54 @@
 name = "llm-gateway"
 version = "0.1.0"
 edition = "2024"
+description = "A generic LLM proxy/router with multi-provider support (Anthropic, OpenAI/ChatGPT, XiaoMiMo)"
+license = "MIT"
 
 [dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["json"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async utilities
+futures = "0.3"
+tokio-stream = "0.1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Crypto (for PKCE, JWT decoding)
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# File watching / config
+dirs = "6"
+
+# Bytes for streaming
+bytes = "1"
