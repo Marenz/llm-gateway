@@ -166,7 +166,7 @@ async fn chat_completions(
             req.messages.iter().map(|m| {
                 let role = format!("{:?}", m.role).to_lowercase();
                 let content = match &m.content {
-                    crate::types::OpenAIMessageContent::Text(t) => t.chars().take(200).collect::<String>(),
+                    crate::types::OpenAIMessageContent::Text(t) => t.clone(),
                     crate::types::OpenAIMessageContent::Parts(p) => format!("[{} parts]", p.len()),
                     crate::types::OpenAIMessageContent::Null => String::new(),
                 };
@@ -224,7 +224,7 @@ async fn chat_completions(
                                     body.usage.input_tokens,
                                     body.usage.output_tokens,
                                     body.stop_reason.as_deref().unwrap_or("unknown"),
-                                    content.chars().take(500).collect::<String>(),
+                                    content.clone(),
                                 );
                                 Json(translate_response(&body, &req.model, &request_id)).into_response()
                             },
@@ -484,7 +484,7 @@ async fn collect_chatgpt_stream(
         state.input_tokens,
         state.output_tokens,
         finish_reason,
-        text.chars().take(500).collect::<String>(),
+        text.clone(),
     );
 
     let mut message = json!({ "role": "assistant", "content": text });
@@ -524,7 +524,7 @@ async fn translate_chatgpt_sse(
                 model,
                 state.input_tokens,
                 state.output_tokens,
-                state.accumulated_text.chars().take(500).collect::<String>(),
+                state.accumulated_text.clone(),
             );
         }
         chunks
@@ -551,7 +551,7 @@ async fn translate_anthropic_sse(
                 model,
                 state.input_tokens,
                 state.output_tokens,
-                state.accumulated_text.chars().take(500).collect::<String>(),
+                state.accumulated_text.clone(),
             );
         }
         chunks
