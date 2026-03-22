@@ -302,6 +302,7 @@ pub struct ChatgptStreamState {
     /// call_id -> (index, name)
     pub tool_calls: HashMap<String, (usize, String)>,
     pub tool_call_count: usize,
+    pub accumulated_text: String,
 }
 
 /// Translate a Responses API SSE event data string to OpenAI SSE lines.
@@ -322,6 +323,7 @@ pub fn translate_stream_event(
             if delta.is_empty() {
                 return vec![];
             }
+            state.accumulated_text.push_str(delta);
             let mut chunks = vec![];
             maybe_role_chunk(model, message_id, state, &mut chunks);
             chunks.push(sse(json!({

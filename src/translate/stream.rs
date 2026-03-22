@@ -12,6 +12,7 @@ pub struct StreamState {
     pub output_tokens: u32,
     pub sent_role: bool,
     pub tool_calls: HashMap<u32, StreamToolCall>,
+    pub accumulated_text: String,
 }
 
 pub struct StreamToolCall {
@@ -26,6 +27,7 @@ impl Default for StreamState {
             output_tokens: 0,
             sent_role: false,
             tool_calls: HashMap::new(),
+            accumulated_text: String::new(),
         }
     }
 }
@@ -56,6 +58,7 @@ pub fn translate_stream_event(
         }
         AnthropicStreamEvent::ContentBlockDelta { index, delta } => match delta {
             AnthropicContentBlockDelta::TextDelta { text } => {
+                state.accumulated_text.push_str(&text);
                 let mut chunks = Vec::new();
                 maybe_emit_role(model, message_id, state, &mut chunks);
                 chunks.push(sse_line(json!({
