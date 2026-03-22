@@ -151,11 +151,32 @@ async fn chat_completions(
     Json(req): Json<OpenAIRequest>,
 ) -> Response {
     let request_id = Uuid::new_v4().simple().to_string();
+    let started_at = std::time::Instant::now();
+
     let Some(resolved) = state.model_resolver.resolve(&req.model) else {
         return error_response(StatusCode::BAD_REQUEST, format!("unknown model: {}", req.model));
     };
 
-    match resolved.provider_kind {
+    // Log the incoming conversation at DEBUG level
+    tracing::debug!(
+        request_id = %request_id,
+        model = %req.model,
+        stream = req.stream.unwrap_or(false),
+        messages = %{
+            req.messages.iter().map(|m| {
+                let role = format!("{:?}", m.role).to_lowercase();
+                let content = match &m.content {
+                    crate::types::OpenAIMessageContent::Text(t) => t.chars().take(200).collect::<String>(),
+                    crate::types::OpenAIMessageContent::Parts(p) => format!("[{} parts]", p.len()),
+                    crate::types::OpenAIMessageContent::Null => String::new(),
+                };
+                format!("{role}: {content}")
+            }).collect::<Vec<_>>().join(" | ")
+        },
+        "→ request"
+    );
+
+    let response = match resolved.provider_kind {
         ProviderKind::Anthropic => {
             let Some(provider) = state.anthropic.as_ref() else {
                 return error_response(StatusCode::BAD_GATEWAY, "anthropic provider not configured");
@@ -251,7 +272,19 @@ async fn chat_completions(
             upstream_request.model = resolved.upstream_model;
             proxy_openai(provider, &upstream_request).await
         }
-    }
+    };
+
+    let elapsed_ms = started_at.elapsed().as_millis();
+    let status = response.status();
+    info!(
+        model = %req.model,
+        status = %status.as_u16(),
+        stream = req.stream.unwrap_or(false),
+        elapsed_ms = elapsed_ms,
+        "← response"
+    );
+
+    response
 }
 
 async fn messages(
