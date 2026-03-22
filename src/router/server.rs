@@ -219,7 +219,7 @@ async fn chat_completions(
                                     _ => None,
                                 }).collect::<Vec<_>>().join("");
                                 tracing::debug!(
-                                    "← assistant model={} tokens={}/{} finish={} content={:?}",
+                                    "← done model={} tokens={}/{} finish={} content={:?}",
                                     req.model,
                                     body.usage.input_tokens,
                                     body.usage.output_tokens,
@@ -289,13 +289,8 @@ async fn chat_completions(
 
     let elapsed_ms = started_at.elapsed().as_millis();
     let status = response.status();
-    info!(
-        model = %req.model,
-        status = %status.as_u16(),
-        stream = req.stream.unwrap_or(false),
-        elapsed_ms = elapsed_ms,
-        "← response"
-    );
+    let label = if req.stream.unwrap_or(false) { "← response (first byte)" } else { "← response" };
+    info!(model = %req.model, status = %status.as_u16(), elapsed_ms = elapsed_ms, "{label}");
 
     response
 }
@@ -484,7 +479,7 @@ async fn collect_chatgpt_stream(
     let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
     tracing::debug!(
-        "← assistant model={} tokens={}/{} finish={} content={:?}",
+        "← done model={} tokens={}/{} finish={} content={:?}",
         model,
         state.input_tokens,
         state.output_tokens,
@@ -525,7 +520,7 @@ async fn translate_chatgpt_sse(
         let chunks = chatgpt_translate::translate_stream_event(event_type, event_data, &model, &request_id, state);
         if chunks.iter().any(|c| c.contains("[DONE]")) {
             tracing::debug!(
-                "← assistant (stream) model={} tokens={}/{} content={:?}",
+                "← done (stream) model={} tokens={}/{} content={:?}",
                 model,
                 state.input_tokens,
                 state.output_tokens,
@@ -552,7 +547,7 @@ async fn translate_anthropic_sse(
         // Log accumulated content when stream completes
         if chunks.iter().any(|c| c.contains("[DONE]")) {
             tracing::debug!(
-                "← assistant (stream) model={} tokens={}/{} content={:?}",
+                "← done (stream) model={} tokens={}/{} content={:?}",
                 model,
                 state.input_tokens,
                 state.output_tokens,
