@@ -219,12 +219,12 @@ async fn chat_completions(
                                     _ => None,
                                 }).collect::<Vec<_>>().join("");
                                 tracing::debug!(
-                                    model = %req.model,
-                                    content = %content.chars().take(500).collect::<String>(),
-                                    finish_reason = %body.stop_reason.as_deref().unwrap_or("unknown"),
-                                    input_tokens = body.usage.input_tokens,
-                                    output_tokens = body.usage.output_tokens,
-                                    "← assistant"
+                                    "← assistant model={} tokens={}/{} finish={} content={:?}",
+                                    req.model,
+                                    body.usage.input_tokens,
+                                    body.usage.output_tokens,
+                                    body.stop_reason.as_deref().unwrap_or("unknown"),
+                                    content.chars().take(500).collect::<String>(),
                                 );
                                 Json(translate_response(&body, &req.model, &request_id)).into_response()
                             },
@@ -484,12 +484,12 @@ async fn collect_chatgpt_stream(
     let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
     tracing::debug!(
-        model = %model,
-        content = %text.chars().take(500).collect::<String>(),
-        finish_reason = %finish_reason,
-        input_tokens = state.input_tokens,
-        output_tokens = state.output_tokens,
-        "← assistant"
+        "← assistant model={} tokens={}/{} finish={} content={:?}",
+        model,
+        state.input_tokens,
+        state.output_tokens,
+        finish_reason,
+        text.chars().take(500).collect::<String>(),
     );
 
     let mut message = json!({ "role": "assistant", "content": text });
@@ -525,11 +525,11 @@ async fn translate_chatgpt_sse(
         let chunks = chatgpt_translate::translate_stream_event(event_type, event_data, &model, &request_id, state);
         if chunks.iter().any(|c| c.contains("[DONE]")) {
             tracing::debug!(
-                model = %model,
-                content = %state.accumulated_text.chars().take(500).collect::<String>(),
-                input_tokens = state.input_tokens,
-                output_tokens = state.output_tokens,
-                "← assistant (stream)"
+                "← assistant (stream) model={} tokens={}/{} content={:?}",
+                model,
+                state.input_tokens,
+                state.output_tokens,
+                state.accumulated_text.chars().take(500).collect::<String>(),
             );
         }
         chunks
@@ -552,11 +552,11 @@ async fn translate_anthropic_sse(
         // Log accumulated content when stream completes
         if chunks.iter().any(|c| c.contains("[DONE]")) {
             tracing::debug!(
-                model = %model,
-                content = %state.accumulated_text.chars().take(500).collect::<String>(),
-                input_tokens = state.input_tokens,
-                output_tokens = state.output_tokens,
-                "← assistant (stream)"
+                "← assistant (stream) model={} tokens={}/{} content={:?}",
+                model,
+                state.input_tokens,
+                state.output_tokens,
+                state.accumulated_text.chars().take(500).collect::<String>(),
             );
         }
         chunks
