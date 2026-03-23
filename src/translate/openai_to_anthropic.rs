@@ -214,7 +214,7 @@ fn extract_text(content: &OpenAIMessageContent) -> String {
         OpenAIMessageContent::Parts(parts) => parts
             .iter()
             .filter_map(|part| match part {
-                crate::types::OpenAIContentPart::Text { text } => Some(text.as_str()),
+                crate::types::OpenAIContentPart::Text { text, .. } => Some(text.as_str()),
                 crate::types::OpenAIContentPart::ImageUrl { .. } => None,
             })
             .collect::<Vec<_>>()

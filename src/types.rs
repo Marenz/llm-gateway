@@ -69,13 +69,6 @@ pub enum OpenAIMessageContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum OpenAIContentPart {
-    Text { text: String },
-    ImageUrl { image_url: OpenAIImageUrl },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,6 +400,19 @@ pub enum AnthropicStreamEvent {
     Ping,
     Error {
         error: AnthropicError,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAIContentPart {
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
+    },
+    ImageUrl {
+        image_url: OpenAIImageUrl,
     },
 }
 

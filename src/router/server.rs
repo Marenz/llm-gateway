@@ -282,7 +282,11 @@ async fn chat_completions(
                 return error_response(StatusCode::BAD_GATEWAY, "provider not configured");
             };
             let mut upstream_request = req.clone();
-            upstream_request.model = resolved.upstream_model;
+            upstream_request.model = resolved.upstream_model.clone();
+            // XiaoMiMo supports OpenAI-style cache_control markers on content parts
+            if resolved.provider_kind == ProviderKind::XiaomiMimo {
+                apply_openai_cache_markers(&mut upstream_request.messages);
+            }
             proxy_openai(provider, &upstream_request).await
         }
     };
@@ -705,6 +709,40 @@ fn clone_content_type(headers: &reqwest::header::HeaderMap) -> Vec<(header::Head
 
 fn sse_headers() -> Vec<(header::HeaderName, HeaderValue)> {
     vec![(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))]
+}
+
+/// Apply cache_control markers to the last 3 messages for providers that support it (e.g. XiaoMiMo).
+/// Converts string content to a content-parts array with cache_control on the last part.
+fn apply_openai_cache_markers(messages: &mut Vec<crate::types::OpenAIMessage>) {
+    let cache_control = serde_json::json!({"type": "ephemeral"});
+    let n = messages.len();
+    let targets: Vec<usize> = (0..3).filter_map(|i| n.checked_sub(i + 1)).collect();
+
+    for idx in targets {
+        if let Some(msg) = messages.get_mut(idx) {
+            match &msg.content {
+                crate::types::OpenAIMessageContent::Text(t) => {
+                    let text = t.clone();
+                    msg.content = crate::types::OpenAIMessageContent::Parts(vec![
+                        crate::types::OpenAIContentPart::Text {
+                            text,
+                            cache_control: Some(cache_control.clone()),
+                        },
+                    ]);
+                }
+                crate::types::OpenAIMessageContent::Parts(parts) => {
+                    let mut new_parts = parts.clone();
+                    if let Some(last) = new_parts.last_mut() {
+                        if let crate::types::OpenAIContentPart::Text { cache_control: cc, .. } = last {
+                            *cc = Some(cache_control.clone());
+                        }
+                    }
+                    msg.content = crate::types::OpenAIMessageContent::Parts(new_parts);
+                }
+                crate::types::OpenAIMessageContent::Null => {}
+            }
+        }
+    }
 }
 
 fn extract_auth_header(headers: &HeaderMap) -> Option<String> {

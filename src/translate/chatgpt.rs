@@ -175,7 +175,7 @@ fn build_user_content(content: &OpenAIMessageContent) -> Value {
             let items: Vec<Value> = parts
                 .iter()
                 .map(|part| match part {
-                    crate::types::OpenAIContentPart::Text { text } => {
+                    crate::types::OpenAIContentPart::Text { text, .. } => {
                         json!({ "type": "input_text", "text": text })
                     }
                     crate::types::OpenAIContentPart::ImageUrl { image_url } => {
@@ -195,7 +195,7 @@ fn extract_text(content: &OpenAIMessageContent) -> String {
         OpenAIMessageContent::Parts(parts) => parts
             .iter()
             .filter_map(|p| match p {
-                crate::types::OpenAIContentPart::Text { text } => Some(text.as_str()),
+                crate::types::OpenAIContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
