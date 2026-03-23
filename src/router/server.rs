@@ -215,7 +215,7 @@ async fn chat_completions(
                         status if status.is_success() => match response.json::<AnthropicResponse>().await {
                             Ok(body) => {
                                 let content = body.content.iter().filter_map(|b| match b {
-                                    crate::types::AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                                    crate::types::AnthropicContentBlock::Text { text, cache_control: None } => Some(text.as_str()),
                                     _ => None,
                                 }).collect::<Vec<_>>().join("");
                                 tracing::debug!(
@@ -800,7 +800,7 @@ impl AnthropicProvider {
             if oauth::anthropic::is_oauth_token(&api_key) {
                 request = request
                     .bearer_auth(&api_key)
-                    .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+                    .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31")
                     .header("user-agent", "claude-cli/2.1.80 (external, cli)")
                     .header("x-app", "cli");
             } else {
@@ -829,7 +829,7 @@ impl AnthropicProvider {
         if oauth::anthropic::is_oauth_token(&api_key) {
             request = request
                 .bearer_auth(&api_key)
-                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31")
                 .header("user-agent", "claude-cli/2.1.80 (external, cli)")
                 .header("x-app", "cli");
         } else {

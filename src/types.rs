@@ -290,6 +290,8 @@ pub struct AnthropicSystemMessage {
 pub enum AnthropicContentBlock {
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     #[serde(rename = "tool_use")]
     ToolUse {
@@ -301,6 +303,8 @@ pub enum AnthropicContentBlock {
     ToolResult {
         tool_use_id: String,
         content: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     Thinking {
         thinking: String,

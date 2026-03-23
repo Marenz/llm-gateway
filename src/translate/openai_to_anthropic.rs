@@ -18,7 +18,11 @@ pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::Ant
                 &mut messages,
                 AnthropicMessage {
                     role: "user".to_string(),
-                    content: AnthropicMessageContent::Text(extract_text(&message.content)),
+                    // Use blocks so we can attach cache_control later
+                    content: AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::Text {
+                        text: extract_text(&message.content),
+                        cache_control: None,
+                    }]),
                 },
             ),
             crate::types::OpenAIRole::Assistant => {
@@ -36,6 +40,7 @@ pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::Ant
                                     content: serde_json::Value::String(extract_text(
                                         &message.content,
                                     )),
+                                    cache_control: None,
                                 },
                             ]),
                         },
@@ -44,6 +49,10 @@ pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::Ant
             }
         }
     }
+
+    // Apply cache_control breakpoints. Anthropic allows max 4 total.
+    // Use 1 on the last system block, 3 on the last 3 message turns.
+    apply_cache_breakpoints(&mut messages);
 
     let mut tools = req.tools.as_ref().map(|tools| {
         tools
@@ -118,7 +127,48 @@ fn collect_system_prompt(messages: &[OpenAIMessage]) -> Option<AnthropicSystem> 
         }
     }
 
+    // Mark the last system block as a cache breakpoint (uses 1 of 4 allowed)
+    if let Some(last) = blocks.last_mut() {
+        last.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+    }
+
     Some(AnthropicSystem::Messages(blocks))
+}
+
+/// Apply cache_control breakpoints to the last 3 messages (using up remaining 3 of 4 allowed).
+/// Attaches to the last content block of each targeted message.
+fn apply_cache_breakpoints(messages: &mut Vec<AnthropicMessage>) {
+    let cache_marker = serde_json::json!({"type": "ephemeral"});
+    let n = messages.len();
+    let targets: Vec<usize> = (0..3).filter_map(|i| n.checked_sub(i + 1)).collect();
+
+    for idx in targets {
+        if let Some(msg) = messages.get_mut(idx) {
+            match &mut msg.content {
+                AnthropicMessageContent::Blocks(blocks) => {
+                    if let Some(last_block) = blocks.last_mut() {
+                        match last_block {
+                            AnthropicContentBlock::Text { cache_control, .. } => {
+                                *cache_control = Some(cache_marker.clone());
+                            }
+                            AnthropicContentBlock::ToolResult { cache_control, .. } => {
+                                *cache_control = Some(cache_marker.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                AnthropicMessageContent::Text(t) => {
+                    let text = t.clone();
+                    msg.content =
+                        AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::Text {
+                            text,
+                            cache_control: Some(cache_marker.clone()),
+                        }]);
+                }
+            }
+        }
+    }
 }
 
 fn translate_assistant_message(message: &OpenAIMessage) -> AnthropicMessage {
@@ -126,7 +176,10 @@ fn translate_assistant_message(message: &OpenAIMessage) -> AnthropicMessage {
     let text = extract_text(&message.content);
 
     if !text.is_empty() {
-        blocks.push(AnthropicContentBlock::Text { text });
+        blocks.push(AnthropicContentBlock::Text {
+            text,
+            cache_control: None,
+        });
     }
 
     if let Some(tool_calls) = &message.tool_calls {
@@ -146,7 +199,10 @@ fn translate_assistant_message(message: &OpenAIMessage) -> AnthropicMessage {
         role: "assistant".to_string(),
         content: match blocks.as_slice() {
             [] => AnthropicMessageContent::Text(String::new()),
-            [AnthropicContentBlock::Text { text }] => AnthropicMessageContent::Text(text.clone()),
+            [AnthropicContentBlock::Text {
+                text,
+                cache_control: None,
+            }] => AnthropicMessageContent::Text(text.clone()),
             _ => AnthropicMessageContent::Blocks(blocks),
         },
     }
@@ -239,7 +295,10 @@ fn content_into_blocks(content: AnthropicMessageContent) -> Vec<AnthropicContent
             if text.is_empty() {
                 Vec::new()
             } else {
-                vec![AnthropicContentBlock::Text { text }]
+                vec![AnthropicContentBlock::Text {
+                    text,
+                    cache_control: None,
+                }]
             }
         }
         AnthropicMessageContent::Blocks(blocks) => blocks,

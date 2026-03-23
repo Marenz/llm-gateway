@@ -16,7 +16,7 @@ pub fn translate_response(
 
     for block in &resp.content {
         match block {
-            AnthropicContentBlock::Text { text } => text_parts.push(text.clone()),
+            AnthropicContentBlock::Text { text, .. } => text_parts.push(text.clone()),
             AnthropicContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(OpenAIToolCall {
                     id: id.clone(),
