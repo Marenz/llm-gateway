@@ -230,9 +230,12 @@ async fn chat_completions(
                             },
                             Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
                         },
-                        status => match response.json::<AnthropicErrorResponse>().await {
-                            Ok(body) => (status, Json(translate_error(&body))).into_response(),
-                            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+                        status => {
+                            let forwarded = clone_ratelimit_headers(response.headers());
+                            match response.json::<AnthropicErrorResponse>().await {
+                                Ok(body) => build_response(status, forwarded, Body::from(serde_json::to_vec(&translate_error(&body)).unwrap_or_default())),
+                                Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+                            }
                         },
                     },
                     Err(err) => {
@@ -700,11 +703,33 @@ fn build_response(status: reqwest::StatusCode, headers: Vec<(header::HeaderName,
 }
 
 fn clone_content_type(headers: &reqwest::header::HeaderMap) -> Vec<(header::HeaderName, HeaderValue)> {
-    headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok())
-        .map(|value| vec![(header::CONTENT_TYPE, value)])
-        .unwrap_or_default()
+    let mut result = vec![];
+    if let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) {
+        if let Ok(v) = HeaderValue::from_bytes(value.as_bytes()) {
+            result.push((header::CONTENT_TYPE, v));
+        }
+    }
+    result.extend(clone_ratelimit_headers(headers));
+    result
+}
+
+fn clone_ratelimit_headers(headers: &reqwest::header::HeaderMap) -> Vec<(header::HeaderName, HeaderValue)> {
+    // Forward rate-limit / retry headers so downstream clients can honor
+    // server-provided backoff hints on 429 responses.
+    let mut result = Vec::new();
+    for (name, value) in headers.iter() {
+        let n = name.as_str();
+        let dominated = n == "retry-after"
+            || n == "x-should-retry"
+            || n.starts_with("x-ratelimit-")
+            || n.starts_with("anthropic-ratelimit-");
+        if dominated {
+            if let Ok(v) = HeaderValue::from_bytes(value.as_bytes()) {
+                result.push((header::HeaderName::from_bytes(name.as_ref()).unwrap(), v));
+            }
+        }
+    }
+    result
 }
 
 fn sse_headers() -> Vec<(header::HeaderName, HeaderValue)> {
