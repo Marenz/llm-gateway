@@ -87,6 +87,17 @@ impl ModelResolver {
                         });
                     }
                 }
+                ProviderConfig::Zen(cfg) => {
+                    implicit.zen.get_or_insert_with(|| cfg.name.clone());
+                    for model in &cfg.models {
+                        routes.push(ModelRoute {
+                            pattern: model.clone(),
+                            provider_kind: ProviderKind::Zen,
+                            provider_name: cfg.name.clone(),
+                            strip_prefix: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -141,6 +152,15 @@ impl ModelResolver {
             });
         }
 
+        if let Some(provider_name) = implicit.zen {
+            routes.push(ModelRoute {
+                pattern: "zen/".to_string(),
+                provider_kind: ProviderKind::Zen,
+                provider_name,
+                strip_prefix: Some("zen/".to_string()),
+            });
+        }
+
         Self {
             routes,
             aliases: config.model_aliases.clone(),
@@ -175,4 +195,5 @@ struct ImplicitProviders {
     openai: Option<String>,
     mimo: Option<String>,
     opencode_go: Option<String>,
+    zen: Option<String>,
 }

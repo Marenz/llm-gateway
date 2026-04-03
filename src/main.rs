@@ -275,6 +275,14 @@ async fn handle_status(config_path: &str) -> anyhow::Result<()> {
                     println!("no api key");
                 }
             }
+            config::ProviderConfig::Zen(cfg) => {
+                print!("  zen ({}): ", cfg.name);
+                if cfg.api_key.is_some() {
+                    println!("api key configured");
+                } else {
+                    println!("no api key");
+                }
+            }
         }
     }
 

@@ -450,6 +450,7 @@ pub enum ProviderKind {
     XiaomiMimo,
     OpenaiCompatible,
     OpenCodeGo,
+    Zen,
 }
 
 #[derive(Debug, Clone)]

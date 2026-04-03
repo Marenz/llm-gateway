@@ -73,6 +73,7 @@ src/
 | OpenAI | API key | `openai` |
 | XiaoMiMo | API key | `xiaomi_mimo` |
 | OpenCode Go | API key (subscription) | `opencode_go` |
+| OpenCode Zen | API key (subscription) | `zen` |
 | Generic | API key + custom header | `openai_compatible` |
 
 ## Conventions

@@ -50,6 +50,8 @@ pub enum ProviderConfig {
     OpenaiCompatible(OpenaiCompatibleProviderConfig),
     /// OpenCode Go subscription provider
     OpencodeGo(OpencodeGoProviderConfig),
+    /// OpenCode Zen provider
+    Zen(ZenProviderConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +159,22 @@ pub struct OpencodeGoProviderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZenProviderConfig {
+    #[serde(default = "default_zen_name")]
+    pub name: String,
+
+    /// API key from opencode.ai/zen. Supports "env:VAR_NAME" syntax.
+    pub api_key: Option<String>,
+
+    /// OpenAI-compatible base URL (for /v1/chat/completions)
+    #[serde(default = "default_zen_api_base")]
+    pub api_base: String,
+
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenaiCompatibleProviderConfig {
     pub name: String,
 
@@ -218,6 +236,12 @@ fn default_opencode_go_openai_base() -> String {
 fn default_opencode_go_anthropic_base() -> String {
     "https://opencode.ai/zen/go".to_string()
 }
+fn default_zen_name() -> String {
+    "zen".to_string()
+}
+fn default_zen_api_base() -> String {
+    "https://opencode.ai/zen".to_string()
+}
 
 impl GatewayConfig {
     /// Load config from a JSON file path.
@@ -245,6 +269,9 @@ impl GatewayConfig {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::OpencodeGo(cfg) => {
+                    cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
+                }
+                ProviderConfig::Zen(cfg) => {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::Chatgpt(_) => {

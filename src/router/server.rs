@@ -21,6 +21,7 @@ use crate::config::{
     OpenaiProviderConfig, OpencodeGoProviderConfig, ProviderConfig, XiaomiMimoProviderConfig,
 };
 use crate::oauth;
+use crate::providers::zen::ZenProvider;
 use crate::router::model_resolver::ModelResolver;
 use crate::translate::anthropic_to_openai::{translate_error, translate_response};
 use crate::translate::chatgpt::{self as chatgpt_translate, ChatgptStreamState};
@@ -35,6 +36,7 @@ pub struct AppState {
     pub chatgpt: Option<ChatgptProvider>,
     pub openai_compat_providers: std::collections::HashMap<String, OpenAICompatProvider>,
     pub opencode_go: Option<OpenCodeGoProvider>,
+    pub zen: Option<ZenProvider>,
     pub model_resolver: ModelResolver,
     pub master_key: Option<String>,
 }
@@ -45,6 +47,7 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
     let mut chatgpt = None;
     let mut openai_compat_providers = std::collections::HashMap::new();
     let mut opencode_go = None;
+    let mut zen = None;
 
     for provider in &config.providers {
         match provider {
@@ -71,6 +74,9 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
                 provider.refresh_anthropic_models().await;
                 opencode_go = Some(provider);
             }
+            ProviderConfig::Zen(cfg) => {
+                zen = Some(ZenProvider::new(cfg.clone()));
+            }
         }
     }
 
@@ -79,6 +85,7 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
         chatgpt,
         openai_compat_providers,
         opencode_go,
+        zen,
         model_resolver,
         master_key: config.master_key.clone(),
     });
@@ -138,6 +145,14 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         match provider.fetch_models().await {
             Ok(models) => discovered.extend(models),
             Err(err) => warn!(error = %err, "failed to fetch OpenCode Go models"),
+        }
+    }
+
+    // Zen — live discovery
+    if let Some(provider) = &state.zen {
+        match provider.fetch_models().await {
+            Ok(models) => discovered.extend(models),
+            Err(err) => warn!(error = %err, "failed to fetch Zen models"),
         }
     }
 
@@ -296,6 +311,31 @@ async fn chat_completions(
                         error!(error = %err, "opencode-go request failed");
                         error_response(StatusCode::BAD_GATEWAY, err.to_string())
                     }
+                }
+            }
+        }
+        ProviderKind::Zen => {
+            let Some(provider) = state.zen.as_ref() else {
+                return error_response(StatusCode::BAD_GATEWAY, "zen provider not configured");
+            };
+            // Zen models: most use /v1/chat/completions, Claude uses /v1/messages
+            // For simplicity, try chat/completions first (works for most models)
+            let mut upstream_request = req.clone();
+            upstream_request.model = resolved.upstream_model.clone();
+            match provider
+                .send_openai_json("/v1/chat/completions", &upstream_request)
+                .await
+            {
+                Ok(response) => {
+                    if req.stream.unwrap_or(false) {
+                        passthrough_sse(response)
+                    } else {
+                        proxy_json_response(response).await
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "zen request failed");
+                    error_response(StatusCode::BAD_GATEWAY, err.to_string())
                 }
             }
         }
