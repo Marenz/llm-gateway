@@ -267,6 +267,14 @@ async fn handle_status(config_path: &str) -> anyhow::Result<()> {
                     println!("no api key");
                 }
             }
+            config::ProviderConfig::OpencodeGo(cfg) => {
+                print!("  opencode-go ({}): ", cfg.name);
+                if cfg.api_key.is_some() {
+                    println!("api key configured");
+                } else {
+                    println!("no api key");
+                }
+            }
         }
     }
 
@@ -333,6 +341,18 @@ fn default_config() -> config::GatewayConfig {
                 name: "xiaomi-mimo".to_string(),
                 api_key: Some(key),
                 api_base: "https://api.xiaomimimo.com/v1".to_string(),
+                models: vec![],
+            },
+        ));
+    }
+
+    if let Ok(key) = std::env::var("OPENCODE_GO_API_KEY") {
+        providers.push(config::ProviderConfig::OpencodeGo(
+            config::OpencodeGoProviderConfig {
+                name: "opencode-go".to_string(),
+                api_key: Some(key),
+                openai_api_base: "https://opencode.ai/zen/go".to_string(),
+                anthropic_api_base: "https://opencode.ai/zen/go".to_string(),
                 models: vec![],
             },
         ));

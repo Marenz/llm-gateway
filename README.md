@@ -10,6 +10,7 @@ A generic LLM proxy/router written in Rust. Exposes a unified OpenAI-compatible 
 | **Anthropic** | OAuth token (auto-refresh) or API key | `anthropic/` |
 | **ChatGPT** (subscription) | OAuth device/browser flow | `chatgpt/` |
 | **XiaoMiMo** | API key | `mimo/` |
+| **OpenCode Go** | API key (subscription) | `opencode-go/` |
 | **OpenAI** | API key | `openai/` |
 | **Generic** | API key + custom header | configured name |
 
@@ -48,9 +49,11 @@ llm-gateway login chatgpt
 # requires ChatGPT Plus/Pro/Max subscription
 ```
 
-### XiaoMiMo / OpenAI
+### XiaoMiMo / OpenAI / OpenCode Go
 
-Set `XIAOMI_MIMO_API_KEY` / `OPENAI_API_KEY`, or configure `api_key` in `config.json`.
+Set `XIAOMI_MIMO_API_KEY` / `OPENAI_API_KEY` / `OPENCODE_GO_API_KEY`, or configure `api_key` in `config.json`.
+
+[OpenCode Go](https://opencode.ai/docs/de/go) is a $10/mo subscription providing access to curated open coding models (GLM-5, Kimi K2.5, MiMo-V2-Pro, MiniMax M2.5/M2.7). Most models use the OpenAI-compatible API; MiniMax models use the Anthropic Messages API — the gateway handles both automatically.
 
 ## Usage
 
@@ -102,6 +105,13 @@ Default config path: `~/.config/llm-gateway/config.json`
       "name": "xiaomi-mimo",
       "api_key": "env:XIAOMI_MIMO_API_KEY",
       "api_base": "https://api.xiaomimimo.com/v1"
+    },
+    {
+      "type": "opencode_go",
+      "name": "opencode-go",
+      "api_key": "env:OPENCODE_GO_API_KEY",
+      "openai_api_base": "https://opencode.ai/zen/go",
+      "anthropic_api_base": "https://opencode.ai/zen/go"
     },
     {
       "type": "openai_compatible",

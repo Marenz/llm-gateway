@@ -72,6 +72,7 @@ src/
 | ChatGPT | OAuth device code flow | `chatgpt` |
 | OpenAI | API key | `openai` |
 | XiaoMiMo | API key | `xiaomi_mimo` |
+| OpenCode Go | API key (subscription) | `opencode_go` |
 | Generic | API key + custom header | `openai_compatible` |
 
 ## Conventions

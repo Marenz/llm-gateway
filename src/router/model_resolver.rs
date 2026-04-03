@@ -76,6 +76,17 @@ impl ModelResolver {
                         });
                     }
                 }
+                ProviderConfig::OpencodeGo(cfg) => {
+                    implicit.opencode_go.get_or_insert_with(|| cfg.name.clone());
+                    for model in &cfg.models {
+                        routes.push(ModelRoute {
+                            pattern: model.clone(),
+                            provider_kind: ProviderKind::OpenCodeGo,
+                            provider_name: cfg.name.clone(),
+                            strip_prefix: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -121,6 +132,15 @@ impl ModelResolver {
             });
         }
 
+        if let Some(provider_name) = implicit.opencode_go {
+            routes.push(ModelRoute {
+                pattern: "opencode-go/".to_string(),
+                provider_kind: ProviderKind::OpenCodeGo,
+                provider_name,
+                strip_prefix: Some("opencode-go/".to_string()),
+            });
+        }
+
         Self {
             routes,
             aliases: config.model_aliases.clone(),
@@ -154,4 +174,5 @@ struct ImplicitProviders {
     chatgpt: Option<String>,
     openai: Option<String>,
     mimo: Option<String>,
+    opencode_go: Option<String>,
 }

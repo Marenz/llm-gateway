@@ -34,6 +34,14 @@
       "api_key": "env:XIAOMI_MIMO_API_KEY",
       "api_base": "https://api.xiaomimimo.com/v1",
       "models": []
+    },
+    {
+      "type": "opencode_go",
+      "name": "opencode-go",
+      "api_key": "env:OPENCODE_GO_API_KEY",
+      "openai_api_base": "https://opencode.ai/zen/go",
+      "anthropic_api_base": "https://opencode.ai/zen/go",
+      "models": []
     }
   ],
   "model_aliases": {

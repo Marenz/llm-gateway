@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::config::{
     AnthropicProviderConfig, ChatgptProviderConfig, GatewayConfig, OpenaiCompatibleProviderConfig,
-    OpenaiProviderConfig, ProviderConfig, XiaomiMimoProviderConfig,
+    OpenaiProviderConfig, OpencodeGoProviderConfig, ProviderConfig, XiaomiMimoProviderConfig,
 };
 use crate::oauth;
 use crate::router::model_resolver::ModelResolver;
@@ -31,22 +31,24 @@ use crate::types::{
 };
 
 pub struct AppState {
-    pub anthropic: Option<AnthropicProvider>,
+    pub anthropic_pool: AnthropicPool,
     pub chatgpt: Option<ChatgptProvider>,
     pub openai_compat_providers: std::collections::HashMap<String, OpenAICompatProvider>,
+    pub opencode_go: Option<OpenCodeGoProvider>,
     pub model_resolver: ModelResolver,
     pub master_key: Option<String>,
 }
 
 pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
     let model_resolver = ModelResolver::from_config(&config);
-    let mut anthropic = None;
+    let mut anthropic_providers = Vec::new();
     let mut chatgpt = None;
     let mut openai_compat_providers = std::collections::HashMap::new();
+    let mut opencode_go = None;
 
     for provider in &config.providers {
         match provider {
-            ProviderConfig::Anthropic(cfg) => anthropic = Some(AnthropicProvider::new(cfg.clone())),
+            ProviderConfig::Anthropic(cfg) => anthropic_providers.push(AnthropicProvider::new(cfg.clone())),
             ProviderConfig::Chatgpt(cfg) => chatgpt = Some(ChatgptProvider::new(cfg.clone())),
             ProviderConfig::Openai(cfg) => {
                 openai_compat_providers.insert(
@@ -64,13 +66,19 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
                 openai_compat_providers
                     .insert(cfg.name.clone(), OpenAICompatProvider::new(cfg.clone()));
             }
+            ProviderConfig::OpencodeGo(cfg) => {
+                let mut provider = OpenCodeGoProvider::new(cfg.clone());
+                provider.refresh_anthropic_models().await;
+                opencode_go = Some(provider);
+            }
         }
     }
 
     let state = Arc::new(AppState {
-        anthropic,
+        anthropic_pool: AnthropicPool::new(anthropic_providers),
         chatgpt,
         openai_compat_providers,
+        opencode_go,
         model_resolver,
         master_key: config.master_key.clone(),
     });
@@ -101,8 +109,9 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut discovered: Vec<serde_json::Value> = Vec::new();
 
     // Anthropic — live discovery
-    if let Some(provider) = &state.anthropic {
-        match provider.fetch_models().await {
+    // Anthropic â live discovery from pool
+    if !state.anthropic_pool.is_empty() {
+        match state.anthropic_pool.fetch_models().await {
             Ok(models) => discovered.extend(models),
             Err(err) => warn!(error = %err, "failed to fetch Anthropic models"),
         }
@@ -121,6 +130,14 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         match provider.fetch_models().await {
             Ok(models) => discovered.extend(models),
             Err(err) => warn!(error = %err, "failed to fetch ChatGPT models"),
+        }
+    }
+
+    // OpenCode Go — live discovery
+    if let Some(provider) = &state.opencode_go {
+        match provider.fetch_models().await {
+            Ok(models) => discovered.extend(models),
+            Err(err) => warn!(error = %err, "failed to fetch OpenCode Go models"),
         }
     }
 
@@ -178,72 +195,16 @@ async fn chat_completions(
 
     let response = match resolved.provider_kind {
         ProviderKind::Anthropic => {
-            let Some(provider) = state.anthropic.as_ref() else {
+            if state.anthropic_pool.is_empty() {
                 return error_response(StatusCode::BAD_GATEWAY, "anthropic provider not configured");
-            };
+            }
 
             let mut upstream_request = translate_request(&req);
             upstream_request.model = resolved.upstream_model.clone();
 
-            if req.stream.unwrap_or(false) {
-                match provider
-                    .send_json(
-                        "/v1/messages",
-                        &upstream_request,
-                        extract_auth_header(&headers),
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        translate_anthropic_sse(response, req.model.clone(), request_id).await
-                    }
-                    Err(err) => {
-                        error!(error = %err, "anthropic stream request failed");
-                        error_response(StatusCode::BAD_GATEWAY, err.to_string())
-                    }
-                }
-            } else {
-                match provider
-                    .send_json(
-                        "/v1/messages",
-                        &upstream_request,
-                        extract_auth_header(&headers),
-                    )
-                    .await
-                {
-                    Ok(response) => match response.status() {
-                        status if status.is_success() => match response.json::<AnthropicResponse>().await {
-                            Ok(body) => {
-                                let content = body.content.iter().filter_map(|b| match b {
-                                    crate::types::AnthropicContentBlock::Text { text, cache_control: None } => Some(text.as_str()),
-                                    _ => None,
-                                }).collect::<Vec<_>>().join("");
-                                tracing::debug!(
-                                    "← done model={} tokens={}/{} finish={} content={:?}",
-                                    req.model,
-                                    body.usage.input_tokens,
-                                    body.usage.output_tokens,
-                                    body.stop_reason.as_deref().unwrap_or("unknown"),
-                                    content.clone(),
-                                );
-                                Json(translate_response(&body, &req.model, &request_id)).into_response()
-                            },
-                            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-                        },
-                        status => {
-                            let forwarded = clone_ratelimit_headers(response.headers());
-                            match response.json::<AnthropicErrorResponse>().await {
-                                Ok(body) => build_response(status, forwarded, Body::from(serde_json::to_vec(&translate_error(&body)).unwrap_or_default())),
-                                Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-                            }
-                        },
-                    },
-                    Err(err) => {
-                        error!(error = %err, "anthropic request failed");
-                        error_response(StatusCode::BAD_GATEWAY, err.to_string())
-                    }
-                }
-            }
+            // Try with failover across providers
+            let auth_header = extract_auth_header(&headers);
+            anthropic_with_failover(&state, &upstream_request, auth_header, &req, &request_id).await
         }
         ProviderKind::Chatgpt => {
             let Some(provider) = state.chatgpt.as_ref() else {
@@ -292,6 +253,52 @@ async fn chat_completions(
             }
             proxy_openai(provider, &upstream_request).await
         }
+        ProviderKind::OpenCodeGo => {
+            let Some(provider) = state.opencode_go.as_ref() else {
+                return error_response(StatusCode::BAD_GATEWAY, "opencode-go provider not configured");
+            };
+            if provider.uses_anthropic_format(&resolved.upstream_model) {
+                // Anthropic-compatible models (MiniMax)
+                let mut upstream_request = translate_request(&req);
+                upstream_request.model = resolved.upstream_model.clone();
+                match provider
+                    .send_anthropic_json("/v1/messages", &upstream_request)
+                    .await
+                {
+                    Ok(response) => {
+                        if req.stream.unwrap_or(false) {
+                            translate_anthropic_sse(response, req.model.clone(), request_id).await
+                        } else {
+                            handle_anthropic_json_response(response, &req, &request_id).await
+                        }
+                    }
+                    Err(err) => {
+                        error!(error = %err, "opencode-go anthropic request failed");
+                        error_response(StatusCode::BAD_GATEWAY, err.to_string())
+                    }
+                }
+            } else {
+                // OpenAI-compatible models (GLM-5, Kimi, MiMo)
+                let mut upstream_request = req.clone();
+                upstream_request.model = resolved.upstream_model.clone();
+                match provider
+                    .send_openai_json("/v1/chat/completions", &upstream_request)
+                    .await
+                {
+                    Ok(response) => {
+                        if req.stream.unwrap_or(false) {
+                            passthrough_sse(response)
+                        } else {
+                            proxy_json_response(response).await
+                        }
+                    }
+                    Err(err) => {
+                        error!(error = %err, "opencode-go request failed");
+                        error_response(StatusCode::BAD_GATEWAY, err.to_string())
+                    }
+                }
+            }
+        }
     };
 
     let elapsed_ms = started_at.elapsed().as_millis();
@@ -307,7 +314,7 @@ async fn messages(
     headers: HeaderMap,
     Json(mut req): Json<AnthropicRequest>,
 ) -> Response {
-    let Some(provider) = state.anthropic.as_ref() else {
+    let Some(provider) = state.anthropic_pool.active_provider() else {
         return error_response(StatusCode::BAD_GATEWAY, "anthropic provider not configured");
     };
 
@@ -353,6 +360,118 @@ async fn auth_middleware(
     }
 
     next.run(req).await
+}
+
+/// Try sending an Anthropic request with automatic failover across pool providers.
+async fn anthropic_with_failover(
+    state: &Arc<AppState>,
+    upstream_request: &AnthropicRequest,
+    auth_header: Option<String>,
+    original_req: &OpenAIRequest,
+    request_id: &str,
+) -> Response {
+    let is_stream = original_req.stream.unwrap_or(false);
+
+    // Try each provider, starting with the best available
+    let mut tried = std::collections::HashSet::new();
+    loop {
+        let Some((idx, provider)) = state.anthropic_pool.pick_provider().await else {
+            return error_response(StatusCode::BAD_GATEWAY, "no Anthropic providers available");
+        };
+
+        if !tried.insert(idx) {
+            // Already tried all providers â return the error from the last one
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "all Anthropic providers are rate-limited",
+            );
+        }
+
+        info!(provider = %provider.name, "trying Anthropic provider");
+
+        match provider
+            .send_json("/v1/messages", upstream_request, auth_header.clone())
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+
+                // On rate-limit or server error, record failure and try next provider
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+                {
+                    state.anthropic_pool.record_failure(idx, &response).await;
+                    continue;
+                }
+
+                // Success or client error (4xx) Ã¢ return the response
+                if is_stream {
+                    return translate_anthropic_sse(
+                        response,
+                        original_req.model.clone(),
+                        request_id.to_string(),
+                    )
+                    .await;
+                } else {
+                    return handle_anthropic_json_response(
+                        response,
+                        original_req,
+                        request_id,
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                error!(provider = %provider.name, error = %err, "anthropic request failed");
+                // Network error Ã¢ record a short cooldown and try next
+                let mut available = state.anthropic_pool.available_at.lock().await;
+                if idx < available.len() {
+                    available[idx] = now_secs() + 10;
+                }
+                drop(available);
+                continue;
+            }
+        }
+    }
+}
+
+/// Handle a successful (non-streaming) Anthropic JSON response.
+async fn handle_anthropic_json_response(
+    response: reqwest::Response,
+    original_req: &OpenAIRequest,
+    request_id: &str,
+) -> Response {
+    match response.status() {
+        status if status.is_success() => match response.json::<AnthropicResponse>().await {
+            Ok(body) => {
+                let content = body
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::types::AnthropicContentBlock::Text { text, .. } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                tracing::debug!(
+                    "Ã¢ done model={} tokens={}/{} finish={} content={:?}",
+                    original_req.model,
+                    body.usage.input_tokens,
+                    body.usage.output_tokens,
+                    body.stop_reason.as_deref().unwrap_or("unknown"),
+                    content,
+                );
+                Json(translate_response(&body, &original_req.model, request_id)).into_response()
+            }
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        },
+        status => match response.json::<AnthropicErrorResponse>().await {
+            Ok(body) => (status, Json(translate_error(&body))).into_response(),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        },
+    }
 }
 
 async fn proxy_openai(provider: &OpenAICompatProvider, req: &OpenAIRequest) -> Response {
@@ -640,11 +759,17 @@ where
         let mut data_lines = Vec::new();
         let mut state = StreamState::default();
 
+        let mut chunk_count: u64 = 0;
+        let stream_start = std::time::Instant::now();
         while let Some(chunk) = upstream.next().await {
             let Ok(chunk) = chunk else {
-                warn!("upstream SSE stream ended with an error");
+                warn!("upstream SSE stream ended with an error after {chunk_count} chunks");
                 break;
             };
+            chunk_count += 1;
+            if chunk_count <= 3 || chunk_count % 50 == 0 {
+                tracing::debug!("upstream chunk #{chunk_count} ({} bytes, +{}ms)", chunk.len(), stream_start.elapsed().as_millis());
+            }
 
             for byte in chunk {
                 let ch = byte as char;
@@ -666,12 +791,15 @@ where
                     data_lines.clear();
 
                     if data == "[DONE]" {
+                        tracing::debug!("upstream [DONE] after {chunk_count} chunks, +{}ms", stream_start.elapsed().as_millis());
                         let _ = tx.send(Bytes::from_static(b"data: [DONE]\n\n")).await;
                         continue;
                     }
 
-                    for event in translator(&data, &mut state) {
+                    let translated = translator(&data, &mut state);
+                    for event in translated {
                         if tx.send(Bytes::from(event)).await.is_err() {
+                            tracing::warn!("downstream closed after {chunk_count} chunks");
                             return;
                         }
                     }
@@ -785,6 +913,164 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
         }
     }));
     (status, body).into_response()
+}
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Mutex;
+
+/// Pool of Anthropic providers with sticky failover.
+///
+/// Tracks which provider is currently active. On rate-limit (429) or server error (5xx),
+/// switches to the provider with the earliest recovery time and stays there until it fails too.
+pub struct AnthropicPool {
+    providers: Vec<AnthropicProvider>,
+    active: AtomicUsize,
+    /// Per-provider: unix timestamp (seconds) when the provider becomes available again.
+    /// 0 means available now.
+    available_at: Mutex<Vec<u64>>,
+}
+
+impl AnthropicPool {
+    pub fn new(providers: Vec<AnthropicProvider>) -> Self {
+        let n = providers.len();
+        Self {
+            providers,
+            active: AtomicUsize::new(0),
+            available_at: Mutex::new(vec![0; n]),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// Get the currently active provider.
+    pub fn active_provider(&self) -> Option<&AnthropicProvider> {
+        self.providers.get(self.active.load(Ordering::Relaxed))
+    }
+
+    /// Pick the best available provider: the active one if it's available,
+    /// otherwise the one with the earliest available_at.
+    pub async fn pick_provider(&self) -> Option<(usize, &AnthropicProvider)> {
+        if self.providers.is_empty() {
+            return None;
+        }
+
+        let now = now_secs();
+        let available = self.available_at.lock().await;
+        let active_idx = self.active.load(Ordering::Relaxed);
+
+        // If the active provider is available, use it (sticky)
+        if active_idx < available.len() && available[active_idx] <= now {
+            return Some((active_idx, &self.providers[active_idx]));
+        }
+
+        // Find the provider with the earliest recovery time
+        let best = available
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, t)| **t)
+            .map(|(i, _)| i)?;
+
+        drop(available);
+        self.active.store(best, Ordering::Relaxed);
+        info!(
+            provider = %self.providers[best].name,
+            "switched active Anthropic provider"
+        );
+        Some((best, &self.providers[best]))
+    }
+
+    /// Record a rate-limit / failure for a provider, parsed from response headers.
+    pub async fn record_failure(&self, idx: usize, response: &reqwest::Response) {
+        let mut available = self.available_at.lock().await;
+        if idx >= available.len() {
+            return;
+        }
+
+        let recovery_time = parse_recovery_time(response);
+        available[idx] = recovery_time;
+
+        let provider_name = &self.providers[idx].name;
+        let secs_until = recovery_time.saturating_sub(now_secs());
+        warn!(
+            provider = %provider_name,
+            status = %response.status().as_u16(),
+            retry_in_secs = secs_until,
+            "Anthropic provider rate-limited"
+        );
+
+        // If this was the active provider, switch to the best alternative
+        let active_idx = self.active.load(Ordering::Relaxed);
+        if active_idx == idx {
+            let best = available
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, t)| **t)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            if best != idx {
+                self.active.store(best, Ordering::Relaxed);
+                let secs_until_best = available[best].saturating_sub(now_secs());
+                info!(
+                    from = %provider_name,
+                    to = %self.providers[best].name,
+                    available_in_secs = secs_until_best,
+                    "failover: switched active Anthropic provider"
+                );
+            }
+        }
+    }
+
+    /// Fetch models from the first available provider.
+    pub async fn fetch_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        for provider in &self.providers {
+            match provider.fetch_models().await {
+                Ok(models) if !models.is_empty() => return Ok(models),
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(provider = %provider.name, error = %e, "failed to fetch models");
+                    continue;
+                }
+            }
+        }
+        Ok(vec![])
+    }
+}
+
+/// Parse the recovery timestamp from Anthropic rate-limit response headers.
+fn parse_recovery_time(response: &reqwest::Response) -> u64 {
+    let headers = response.headers();
+    let now = now_secs();
+
+    // Try anthropic-ratelimit-unified-reset (unix timestamp)
+    if let Some(reset) = headers
+        .get("anthropic-ratelimit-unified-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return reset;
+    }
+
+    // Try retry-after (seconds from now)
+    if let Some(retry_after) = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return now + retry_after;
+    }
+
+    // Default: 60 seconds cooldown
+    now + 60
+}
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[derive(Clone)]
@@ -1161,4 +1447,142 @@ impl OpenAICompatProvider {
 
 fn join_url(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
+}
+
+#[derive(Clone)]
+pub struct OpenCodeGoProvider {
+    name: String,
+    openai_api_base: String,
+    anthropic_api_base: String,
+    api_key: Option<String>,
+    client: reqwest::Client,
+    /// Models that use Anthropic Messages API format (fetched from models.dev)
+    anthropic_models: std::collections::HashSet<String>,
+}
+
+impl OpenCodeGoProvider {
+    fn new(config: OpencodeGoProviderConfig) -> Self {
+        Self {
+            name: config.name,
+            openai_api_base: config.openai_api_base,
+            anthropic_api_base: config.anthropic_api_base,
+            api_key: config.api_key,
+            client: reqwest::Client::new(),
+            anthropic_models: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Check whether a model uses the Anthropic Messages API format.
+    pub fn uses_anthropic_format(&self, model: &str) -> bool {
+        self.anthropic_models.contains(model)
+    }
+
+    async fn send_openai_json<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut request = self
+            .client
+            .post(join_url(&self.openai_api_base, path))
+            .json(body);
+
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+
+        request
+            .send()
+            .await
+            .with_context(|| format!("opencode-go openai request to {} failed", self.name))
+    }
+
+    async fn send_anthropic_json<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut request = self
+            .client
+            .post(join_url(&self.anthropic_api_base, path))
+            .header("anthropic-version", "2023-06-01")
+            .json(body);
+
+        if let Some(api_key) = &self.api_key {
+            request = request.header("x-api-key", api_key);
+        }
+
+        request
+            .send()
+            .await
+            .with_context(|| format!("opencode-go anthropic request to {} failed", self.name))
+    }
+
+    /// Fetch available Go models from models.dev (same source opencode uses).
+    /// Also populates the Anthropic-format model set from provider overrides.
+    pub async fn fetch_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let resp = self
+            .client
+            .get("https://models.dev/api.json")
+            .send()
+            .await
+            .context("failed to fetch models.dev")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("models.dev returned {}", resp.status());
+        }
+
+        let body: serde_json::Value = resp.json().await.context("failed to decode models.dev")?;
+
+        let provider = body
+            .get("opencode-go")
+            .context("opencode-go not found in models.dev")?;
+
+        let models = provider
+            .get("models")
+            .and_then(|m| m.as_object())
+            .map(|obj| {
+                obj.values()
+                    .filter_map(|m| {
+                        let id = m.get("id")?.as_str()?;
+                        Some(json!({
+                            "id": format!("opencode-go/{id}"),
+                            "object": "model",
+                            "owned_by": "opencode-go",
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        Ok(models)
+    }
+
+    /// Populate Anthropic-format model set from models.dev.
+    /// Models with provider.npm == "@ai-sdk/anthropic" use the Anthropic
+    /// Messages API; all others use OpenAI-compatible.
+    pub async fn refresh_anthropic_models(&mut self) {
+        if let Ok(resp) = self.client.get("https://models.dev/api.json").send().await {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(models) = body
+                    .get("opencode-go")
+                    .and_then(|p| p.get("models"))
+                    .and_then(|m| m.as_object())
+                {
+                    let mut set = std::collections::HashSet::new();
+                    for (id, m) in models {
+                        let is_anthropic = m
+                            .get("provider")
+                            .and_then(|p| p.get("npm"))
+                            .and_then(|n| n.as_str())
+                            == Some("@ai-sdk/anthropic");
+                        if is_anthropic {
+                            set.insert(id.clone());
+                        }
+                    }
+                    self.anthropic_models = set;
+                }
+            }
+        }
+    }
 }

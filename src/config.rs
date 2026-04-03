@@ -48,6 +48,8 @@ pub enum ProviderConfig {
     XiaomiMimo(XiaomiMimoProviderConfig),
     /// Generic OpenAI-compatible provider
     OpenaiCompatible(OpenaiCompatibleProviderConfig),
+    /// OpenCode Go subscription provider
+    OpencodeGo(OpencodeGoProviderConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +137,26 @@ pub struct XiaomiMimoProviderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpencodeGoProviderConfig {
+    #[serde(default = "default_opencode_go_name")]
+    pub name: String,
+
+    /// API key from opencode.ai. Supports "env:VAR_NAME" syntax.
+    pub api_key: Option<String>,
+
+    /// OpenAI-compatible base URL for most models
+    #[serde(default = "default_opencode_go_openai_base")]
+    pub openai_api_base: String,
+
+    /// Anthropic-compatible base URL for MiniMax models
+    #[serde(default = "default_opencode_go_anthropic_base")]
+    pub anthropic_api_base: String,
+
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenaiCompatibleProviderConfig {
     pub name: String,
 
@@ -187,6 +209,15 @@ fn default_mimo_name() -> String {
 fn default_mimo_api_base() -> String {
     "https://api.xiaomimimo.com/v1".to_string()
 }
+fn default_opencode_go_name() -> String {
+    "opencode-go".to_string()
+}
+fn default_opencode_go_openai_base() -> String {
+    "https://opencode.ai/zen/go".to_string()
+}
+fn default_opencode_go_anthropic_base() -> String {
+    "https://opencode.ai/zen/go".to_string()
+}
 
 impl GatewayConfig {
     /// Load config from a JSON file path.
@@ -211,6 +242,9 @@ impl GatewayConfig {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::OpenaiCompatible(cfg) => {
+                    cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
+                }
+                ProviderConfig::OpencodeGo(cfg) => {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::Chatgpt(_) => {
