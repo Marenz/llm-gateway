@@ -740,14 +740,23 @@ where
         let mut event_type = String::new();
         let mut data_lines: Vec<String> = Vec::new();
         let mut state = ChatgptStreamState::default();
+        let mut raw_buf: Vec<u8> = Vec::new();
 
         while let Some(chunk) = upstream.next().await {
             let Ok(chunk) = chunk else {
                 warn!("chatgpt SSE stream ended with error");
                 break;
             };
-            for byte in chunk {
-                let ch = byte as char;
+            raw_buf.extend_from_slice(&chunk);
+            let valid_up_to = match std::str::from_utf8(&raw_buf) {
+                Ok(_) => raw_buf.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            if valid_up_to == 0 {
+                continue;
+            }
+            let text = std::str::from_utf8(&raw_buf[..valid_up_to]).unwrap();
+            for ch in text.chars() {
                 if ch == '\n' {
                     let line = std::mem::take(&mut line_buf);
                     let line = line.trim_end_matches('\r');
@@ -773,6 +782,7 @@ where
                     line_buf.push(ch);
                 }
             }
+            raw_buf.drain(..valid_up_to);
         }
     });
     futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|b| (Ok(b), rx)) })
@@ -798,6 +808,8 @@ where
         let mut event_buffer = String::new();
         let mut data_lines = Vec::new();
         let mut state = StreamState::default();
+        // Buffer for incomplete UTF-8 sequences at chunk boundaries
+        let mut raw_buf: Vec<u8> = Vec::new();
 
         let mut chunk_count: u64 = 0;
         let stream_start = std::time::Instant::now();
@@ -811,8 +823,19 @@ where
                 tracing::debug!("upstream chunk #{chunk_count} ({} bytes, +{}ms)", chunk.len(), stream_start.elapsed().as_millis());
             }
 
-            for byte in chunk {
-                let ch = byte as char;
+            raw_buf.extend_from_slice(&chunk);
+
+            // Decode as much valid UTF-8 as possible, leaving incomplete sequences
+            let valid_up_to = match std::str::from_utf8(&raw_buf) {
+                Ok(_) => raw_buf.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            if valid_up_to == 0 {
+                continue;
+            }
+            let text = std::str::from_utf8(&raw_buf[..valid_up_to]).unwrap();
+
+            for ch in text.chars() {
                 event_buffer.push(ch);
 
                 if ch != '\n' {
@@ -847,6 +870,7 @@ where
                     data_lines.push(data.trim_start().to_string());
                 }
             }
+            raw_buf.drain(..valid_up_to);
         }
 
         if !data_lines.is_empty() {
