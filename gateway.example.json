@@ -42,6 +42,13 @@
       "openai_api_base": "https://opencode.ai/zen/go",
       "anthropic_api_base": "https://opencode.ai/zen/go",
       "models": []
+    },
+    {
+      "type": "deep_seek",
+      "name": "deepseek",
+      "api_key": "env:DEEPSEEK_API_KEY",
+      "api_base": "https://api.deepseek.com/v1",
+      "models": []
     }
   ],
   "model_aliases": {

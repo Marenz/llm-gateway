@@ -52,6 +52,8 @@ pub enum ProviderConfig {
     OpencodeGo(OpencodeGoProviderConfig),
     /// OpenCode Zen provider
     Zen(ZenProviderConfig),
+    /// DeepSeek provider (OpenAI-compatible)
+    DeepSeek(DeepSeekProviderConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +177,21 @@ pub struct ZenProviderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepSeekProviderConfig {
+    #[serde(default = "default_deepseek_name")]
+    pub name: String,
+
+    /// API key. Supports "env:VAR_NAME" syntax.
+    pub api_key: Option<String>,
+
+    #[serde(default = "default_deepseek_api_base")]
+    pub api_base: String,
+
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenaiCompatibleProviderConfig {
     pub name: String,
 
@@ -242,6 +259,12 @@ fn default_zen_name() -> String {
 fn default_zen_api_base() -> String {
     "https://opencode.ai/zen".to_string()
 }
+fn default_deepseek_name() -> String {
+    "deepseek".to_string()
+}
+fn default_deepseek_api_base() -> String {
+    "https://api.deepseek.com/v1".to_string()
+}
 
 impl GatewayConfig {
     /// Load config from a JSON file path.
@@ -272,6 +295,9 @@ impl GatewayConfig {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::Zen(cfg) => {
+                    cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
+                }
+                ProviderConfig::DeepSeek(cfg) => {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::Chatgpt(_) => {

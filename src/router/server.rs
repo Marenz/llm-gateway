@@ -21,6 +21,7 @@ use crate::config::{
     OpenaiProviderConfig, OpencodeGoProviderConfig, ProviderConfig, XiaomiMimoProviderConfig,
 };
 use crate::oauth;
+use crate::providers::deepseek::DeepSeekProvider;
 use crate::providers::zen::ZenProvider;
 use crate::router::model_resolver::ModelResolver;
 use crate::translate::anthropic_to_openai::{translate_error, translate_response};
@@ -37,6 +38,7 @@ pub struct AppState {
     pub openai_compat_providers: std::collections::HashMap<String, OpenAICompatProvider>,
     pub opencode_go: Option<OpenCodeGoProvider>,
     pub zen: Option<ZenProvider>,
+    pub deepseek: Option<DeepSeekProvider>,
     pub model_resolver: ModelResolver,
     pub master_key: Option<String>,
 }
@@ -48,6 +50,7 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
     let mut openai_compat_providers = std::collections::HashMap::new();
     let mut opencode_go = None;
     let mut zen = None;
+    let mut deepseek = None;
 
     for provider in &config.providers {
         match provider {
@@ -77,6 +80,9 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
             ProviderConfig::Zen(cfg) => {
                 zen = Some(ZenProvider::new(cfg.clone()));
             }
+            ProviderConfig::DeepSeek(cfg) => {
+                deepseek = Some(DeepSeekProvider::new(cfg.clone()));
+            }
         }
     }
 
@@ -86,6 +92,7 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
         openai_compat_providers,
         opencode_go,
         zen,
+        deepseek,
         model_resolver,
         master_key: config.master_key.clone(),
     });
@@ -153,6 +160,14 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         match provider.fetch_models().await {
             Ok(models) => discovered.extend(models),
             Err(err) => warn!(error = %err, "failed to fetch Zen models"),
+        }
+    }
+
+    // DeepSeek — live discovery
+    if let Some(provider) = &state.deepseek {
+        match provider.fetch_models().await {
+            Ok(models) => discovered.extend(models),
+            Err(err) => warn!(error = %err, "failed to fetch DeepSeek models"),
         }
     }
 
@@ -335,6 +350,29 @@ async fn chat_completions(
                 }
                 Err(err) => {
                     error!(error = %err, "zen request failed");
+                    error_response(StatusCode::BAD_GATEWAY, err.to_string())
+                }
+            }
+        }
+        ProviderKind::DeepSeek => {
+            let Some(provider) = state.deepseek.as_ref() else {
+                return error_response(StatusCode::BAD_GATEWAY, "deepseek provider not configured");
+            };
+            let mut upstream_request = req.clone();
+            upstream_request.model = resolved.upstream_model.clone();
+            match provider
+                .send_json("/chat/completions", &upstream_request)
+                .await
+            {
+                Ok(response) => {
+                    if req.stream.unwrap_or(false) {
+                        passthrough_sse(response)
+                    } else {
+                        proxy_json_response(response).await
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "deepseek request failed");
                     error_response(StatusCode::BAD_GATEWAY, err.to_string())
                 }
             }

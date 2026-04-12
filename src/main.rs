@@ -283,6 +283,14 @@ async fn handle_status(config_path: &str) -> anyhow::Result<()> {
                     println!("no api key");
                 }
             }
+            config::ProviderConfig::DeepSeek(cfg) => {
+                print!("  deepseek ({}): ", cfg.name);
+                if cfg.api_key.is_some() {
+                    println!("api key configured");
+                } else {
+                    println!("no api key");
+                }
+            }
         }
     }
 
@@ -361,6 +369,17 @@ fn default_config() -> config::GatewayConfig {
                 api_key: Some(key),
                 openai_api_base: "https://opencode.ai/zen/go".to_string(),
                 anthropic_api_base: "https://opencode.ai/zen/go".to_string(),
+                models: vec![],
+            },
+        ));
+    }
+
+    if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
+        providers.push(config::ProviderConfig::DeepSeek(
+            config::DeepSeekProviderConfig {
+                name: "deepseek".to_string(),
+                api_key: Some(key),
+                api_base: "https://api.deepseek.com/v1".to_string(),
                 models: vec![],
             },
         ));

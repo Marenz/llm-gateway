@@ -451,6 +451,7 @@ pub enum ProviderKind {
     OpenaiCompatible,
     OpenCodeGo,
     Zen,
+    DeepSeek,
 }
 
 #[derive(Debug, Clone)]

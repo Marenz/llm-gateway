@@ -74,6 +74,7 @@ src/
 | XiaoMiMo | API key | `xiaomi_mimo` |
 | OpenCode Go | API key (subscription) | `opencode_go` |
 | OpenCode Zen | API key (subscription) | `zen` |
+| DeepSeek | API key | `deep_seek` |
 | Generic | API key + custom header | `openai_compatible` |
 
 ## Conventions

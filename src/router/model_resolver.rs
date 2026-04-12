@@ -98,6 +98,17 @@ impl ModelResolver {
                         });
                     }
                 }
+                ProviderConfig::DeepSeek(cfg) => {
+                    implicit.deepseek.get_or_insert_with(|| cfg.name.clone());
+                    for model in &cfg.models {
+                        routes.push(ModelRoute {
+                            pattern: model.clone(),
+                            provider_kind: ProviderKind::DeepSeek,
+                            provider_name: cfg.name.clone(),
+                            strip_prefix: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -161,6 +172,15 @@ impl ModelResolver {
             });
         }
 
+        if let Some(provider_name) = implicit.deepseek {
+            routes.push(ModelRoute {
+                pattern: "deepseek/".to_string(),
+                provider_kind: ProviderKind::DeepSeek,
+                provider_name,
+                strip_prefix: Some("deepseek/".to_string()),
+            });
+        }
+
         Self {
             routes,
             aliases: config.model_aliases.clone(),
@@ -196,4 +216,5 @@ struct ImplicitProviders {
     mimo: Option<String>,
     opencode_go: Option<String>,
     zen: Option<String>,
+    deepseek: Option<String>,
 }
