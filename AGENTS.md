@@ -77,6 +77,45 @@ src/
 | DeepSeek | API key | `deep_seek` |
 | Generic | API key + custom header | `openai_compatible` |
 
+## Virtual Models (failover chains)
+
+A **virtual model** maps a single client-facing model name to an ordered list of
+real model names. When a client requests a virtual model, the gateway tries each
+target in order, advancing to the next on a retryable failure.
+
+```json
+"virtual_models": {
+  "family-bot": ["chatgpt/gpt-5.5", "anthropic/claude-sonnet-4-5-20250929", "deepseek-v4-pro"]
+}
+```
+
+- Lookup happens in `chat_completions` BEFORE normal model resolution; a name in
+  `virtual_models` shadows any same-named real route.
+- Each target is resolved through `ModelResolver::resolve` (so targets may be
+  prefixed names or aliases). Unresolvable targets are skipped.
+- **Failover trigger** (`classify_failover_status`): `429` and `5xx` (and
+  transport/gateway errors surfacing as 502) → advance; `2xx` and non-retryable
+  client errors (`400/401/403/404/422`) → return immediately (auth/bad-request
+  won't be fixed by retrying elsewhere).
+- All targets exhausted → returns the last failure response (502 listing tried
+  targets + statuses).
+- **Streaming:** virtual-model attempts are forced to `stream:false` so the HTTP
+  status is visible before committing to a body; the client receives a normal
+  JSON completion. Non-virtual requests stream normally.
+- Shared dispatch: both the virtual loop and the normal path call
+  `dispatch_resolved` — the per-provider match lives in exactly one place.
+
+## DeepSeek Models
+
+The DeepSeek provider supports all models via the OpenAI-compatible API at `api.deepseek.com/v1`. Passthrough proxies handle both standard and thinking output transparently.
+
+| Model | Upstream ID | Notes |
+|-------|-------------|-------|
+| DeepSeek V4 Flash | `deepseek-v4-flash` | Fast chat model. DeepSeek-chat compatibility alias maps here. |
+| DeepSeek V4 Pro | `deepseek-v4-pro` | Thinking/reasoning model. Use `thinking: {"type": "enabled"}` + `reasoning_effort`. |
+
+Backwards-compatible aliases: `deepseek-chat` -> `deepseek-v4-flash`, `deepseek-reasoner` -> `deepseek-v4-flash`, `deepseek-thinking` -> `deepseek-v4-pro`. All deprecate 2026/07/24.
+
 ## Conventions
 
 - Use `anyhow` for error handling

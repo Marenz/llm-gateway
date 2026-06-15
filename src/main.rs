@@ -400,6 +400,7 @@ fn default_config() -> config::GatewayConfig {
         master_key: std::env::var("LLM_GATEWAY_MASTER_KEY").ok(),
         providers,
         model_aliases: Default::default(),
+        virtual_models: Default::default(),
         log_level: config::LogLevel::Normal,
     }
 }

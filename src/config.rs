@@ -25,6 +25,11 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub model_aliases: HashMap<String, String>,
 
+    /// Virtual models: a client-facing name -> ordered list of real model names tried in sequence.
+    /// On a target-unusable failure (402/404/408/429/5xx/transport error) the next target is tried.
+    #[serde(default)]
+    pub virtual_models: HashMap<String, Vec<String>>,
+
     /// Log level: quiet, minimal, normal, verbose
     #[serde(default = "default_log_level")]
     pub log_level: LogLevel,
@@ -317,5 +322,52 @@ fn resolve_env(value: &str) -> Option<String> {
         std::env::var(var_name).ok()
     } else {
         Some(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config_json(extra: &str) -> String {
+        if extra.is_empty() {
+            r#"{ "providers": [] }"#.to_string()
+        } else {
+            format!(r#"{{ "providers": [], {} }}"#, extra)
+        }
+    }
+
+    #[test]
+    fn virtual_models_parses_from_json() {
+        let json = minimal_config_json(
+            r#"
+            "virtual_models": {
+                "family-bot": ["chatgpt/gpt-5.5", "anthropic/claude-sonnet", "deepseek-v4-pro"]
+            }
+            "#,
+        );
+        let config: GatewayConfig = serde_json::from_str(&json).expect("should parse");
+        let targets = config.virtual_models.get("family-bot").expect("key missing");
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0], "chatgpt/gpt-5.5");
+        assert_eq!(targets[1], "anthropic/claude-sonnet");
+        assert_eq!(targets[2], "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn virtual_models_defaults_to_empty_when_absent() {
+        let json = minimal_config_json("");
+        let config: GatewayConfig = serde_json::from_str(&json).expect("should parse");
+        assert!(
+            config.virtual_models.is_empty(),
+            "virtual_models should default to empty HashMap"
+        );
+    }
+
+    #[test]
+    fn virtual_models_empty_map_parses() {
+        let json = minimal_config_json(r#""virtual_models": {}"#);
+        let config: GatewayConfig = serde_json::from_str(&json).expect("should parse");
+        assert!(config.virtual_models.is_empty());
     }
 }

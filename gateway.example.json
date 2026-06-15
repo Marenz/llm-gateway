@@ -48,13 +48,24 @@
       "name": "deepseek",
       "api_key": "env:DEEPSEEK_API_KEY",
       "api_base": "https://api.deepseek.com/v1",
-      "models": []
+      "models": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ]
     }
   ],
+  "virtual_models": {
+    "family-bot": ["chatgpt/gpt-5.5", "anthropic/claude-sonnet-4-5-20250929", "deepseek-v4-pro"]
+  },
   "model_aliases": {
     "claude": "claude-sonnet-4-5-20250929",
     "claude-opus": "claude-opus-4-6-20260205",
     "gpt-4": "chatgpt/gpt-5.4",
-    "mimo": "mimo-v2-flash"
+    "mimo": "mimo-v2-flash",
+    "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+    "deepseek-v4-pro": "deepseek/deepseek-v4-pro",
+    "deepseek-chat": "deepseek/deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek/deepseek-v4-flash",
+    "deepseek-thinking": "deepseek/deepseek-v4-pro"
   }
 }
