@@ -302,6 +302,12 @@ async fn virtual_model_dispatch(
     let mut last_response: Option<Response> = None;
     let mut tried_targets: Vec<String> = Vec::new();
 
+    // Whether the CLIENT asked for streaming. We force non-streaming upstream so
+    // we can inspect status for failover, but if the client wanted SSE we must
+    // re-emit the chosen completion as a stream (clients with SSE-only parsers,
+    // e.g. adapsis llm_takeover, get 0 content from a raw JSON body otherwise).
+    let client_wants_stream = req.stream.unwrap_or(false);
+
     // Guard against self-referential virtual models: cap at list length.
     let max_attempts = targets.len();
 
@@ -335,6 +341,9 @@ async fn virtual_model_dispatch(
 
         match classify_failover_status(reqwest::StatusCode::from_u16(status.as_u16()).unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR)) {
             FailoverDecision::Return => {
+                if client_wants_stream && status.is_success() {
+                    return json_completion_to_sse(response, request_id).await;
+                }
                 return response;
             }
             FailoverDecision::Advance => {
@@ -358,6 +367,66 @@ async fn virtual_model_dispatch(
             format!("all virtual model targets failed: {tried_str}"),
         )
     })
+}
+
+/// Convert a non-streamed OpenAI chat-completion `Response` into a minimal SSE
+/// stream (one content delta chunk + `[DONE]`). Used when a virtual model was
+/// dispatched non-streaming (for failover) but the client requested streaming,
+/// so SSE-only clients still receive the completion.
+async fn json_completion_to_sse(response: Response, request_id: &str) -> Response {
+    let status = response.status();
+    let body_bytes = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("failed to read virtual-model response body: {e}"),
+            )
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            // Not JSON we understand — fall back to returning it verbatim.
+            return build_response(status, vec![(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))], Body::from(body_bytes));
+        }
+    };
+
+    let content = parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let model = parsed.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let id = parsed
+        .get("id")
+        .and_then(|i| i.as_str())
+        .unwrap_or(request_id);
+    let created = parsed.get("created").and_then(|c| c.as_i64()).unwrap_or(0);
+
+    // First chunk: role+content delta. Second: finish. Then [DONE].
+    let chunk = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": serde_json::Value::Null}],
+    });
+    let finish = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    });
+    let sse = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        chunk, finish
+    );
+    build_response(reqwest::StatusCode::OK, sse_headers(), Body::from(sse))
 }
 
 /// Dispatch a single already-resolved model request to its provider.
