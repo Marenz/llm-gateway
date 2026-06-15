@@ -797,7 +797,10 @@ async fn collect_chatgpt_stream(
     use futures::StreamExt;
 
     let mut upstream = response.bytes_stream();
-    let mut line_buf = String::new();
+    // Accumulate raw bytes per line and decode as UTF-8 at line end. Decoding
+    // byte-by-byte via `byte as char` would Latin-1-mangle any multi-byte UTF-8
+    // (e.g. an emoji f0 9f 91 8b became four separate code points -> mojibake).
+    let mut line_buf: Vec<u8> = Vec::new();
     let mut event_type = String::new();
     let mut data_lines: Vec<String> = Vec::new();
     let mut state = ChatgptStreamState::default();
@@ -810,9 +813,9 @@ async fn collect_chatgpt_stream(
     while let Some(chunk) = upstream.next().await {
         let Ok(chunk) = chunk else { break };
         for byte in chunk {
-            let ch = byte as char;
-            if ch == '\n' {
-                let line = std::mem::take(&mut line_buf);
+            if byte == b'\n' {
+                let line_bytes = std::mem::take(&mut line_buf);
+                let line = String::from_utf8_lossy(&line_bytes);
                 let line = line.trim_end_matches('\r');
                 if line.is_empty() {
                     if !data_lines.is_empty() {
@@ -885,7 +888,7 @@ async fn collect_chatgpt_stream(
                     data_lines.push(val.trim_start().to_string());
                 }
             } else {
-                line_buf.push(ch);
+                line_buf.push(byte);
             }
         }
     }
