@@ -148,8 +148,13 @@ fn apply_cache_breakpoints(messages: &mut Vec<AnthropicMessage>) {
                 AnthropicMessageContent::Blocks(blocks) => {
                     if let Some(last_block) = blocks.last_mut() {
                         match last_block {
-                            AnthropicContentBlock::Text { cache_control, .. } => {
-                                *cache_control = Some(cache_marker.clone());
+                            // Anthropic rejects cache_control on empty text blocks
+                            // ("cache_control cannot be set for empty text blocks").
+                            // Skip the breakpoint when the block text is blank.
+                            AnthropicContentBlock::Text { text, cache_control } => {
+                                if !text.trim().is_empty() {
+                                    *cache_control = Some(cache_marker.clone());
+                                }
                             }
                             AnthropicContentBlock::ToolResult { cache_control, .. } => {
                                 *cache_control = Some(cache_marker.clone());
@@ -160,10 +165,17 @@ fn apply_cache_breakpoints(messages: &mut Vec<AnthropicMessage>) {
                 }
                 AnthropicMessageContent::Text(t) => {
                     let text = t.clone();
+                    // Only attach a cache breakpoint to non-empty text; an empty
+                    // string would trigger Anthropic's empty-text-block error.
+                    let cache_control = if text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(cache_marker.clone())
+                    };
                     msg.content =
                         AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::Text {
                             text,
-                            cache_control: Some(cache_marker.clone()),
+                            cache_control,
                         }]);
                 }
             }
