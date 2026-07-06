@@ -22,6 +22,7 @@ use crate::config::{
 };
 use crate::oauth;
 use crate::providers::deepseek::DeepSeekProvider;
+use crate::providers::deepinfra::DeepInfraProvider;
 use crate::providers::zen::ZenProvider;
 use crate::router::model_resolver::ModelResolver;
 use crate::translate::anthropic_to_openai::{translate_error, translate_response};
@@ -39,6 +40,7 @@ pub struct AppState {
     pub opencode_go: Option<OpenCodeGoProvider>,
     pub zen: Option<ZenProvider>,
     pub deepseek: Option<DeepSeekProvider>,
+    pub deepinfra: Option<DeepInfraProvider>,
     pub model_resolver: ModelResolver,
     pub master_key: Option<String>,
     /// Virtual model name -> ordered list of real target model names.
@@ -89,6 +91,7 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
     let mut opencode_go = None;
     let mut zen = None;
     let mut deepseek = None;
+    let mut deepinfra = None;
 
     for provider in &config.providers {
         match provider {
@@ -121,6 +124,9 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
             ProviderConfig::DeepSeek(cfg) => {
                 deepseek = Some(DeepSeekProvider::new(cfg.clone()));
             }
+            ProviderConfig::DeepInfra(cfg) => {
+                deepinfra = Some(DeepInfraProvider::new(cfg.clone()));
+            }
         }
     }
 
@@ -131,6 +137,7 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
         opencode_go,
         zen,
         deepseek,
+        deepinfra,
         model_resolver,
         master_key: config.master_key.clone(),
         virtual_models: config.virtual_models.clone(),
@@ -207,6 +214,14 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         match provider.fetch_models().await {
             Ok(models) => discovered.extend(models),
             Err(err) => warn!(error = %err, "failed to fetch DeepSeek models"),
+        }
+    }
+
+    // DeepInfra — live discovery
+    if let Some(provider) = &state.deepinfra {
+        match provider.fetch_models().await {
+            Ok(models) => discovered.extend(models),
+            Err(err) => warn!(error = %err, "failed to fetch DeepInfra models"),
         }
     }
 
@@ -591,6 +606,29 @@ async fn dispatch_resolved(
                 }
                 Err(err) => {
                     error!(error = %err, "deepseek request failed");
+                    error_response(StatusCode::BAD_GATEWAY, err.to_string())
+                }
+            }
+        }
+        ProviderKind::DeepInfra => {
+            let Some(provider) = state.deepinfra.as_ref() else {
+                return error_response(StatusCode::BAD_GATEWAY, "deepinfra provider not configured");
+            };
+            let mut upstream_request = req.clone();
+            upstream_request.model = resolved.upstream_model.clone();
+            match provider
+                .send_json("/chat/completions", &upstream_request)
+                .await
+            {
+                Ok(response) => {
+                    if req.stream.unwrap_or(false) {
+                        passthrough_sse(response)
+                    } else {
+                        proxy_json_response(response).await
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "deepinfra request failed");
                     error_response(StatusCode::BAD_GATEWAY, err.to_string())
                 }
             }

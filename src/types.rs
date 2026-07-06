@@ -452,6 +452,7 @@ pub enum ProviderKind {
     OpenCodeGo,
     Zen,
     DeepSeek,
+    DeepInfra,
 }
 
 #[derive(Debug, Clone)]

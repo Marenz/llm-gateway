@@ -59,6 +59,8 @@ pub enum ProviderConfig {
     Zen(ZenProviderConfig),
     /// DeepSeek provider (OpenAI-compatible)
     DeepSeek(DeepSeekProviderConfig),
+    /// DeepInfra provider (OpenAI-compatible)
+    DeepInfra(DeepInfraProviderConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +233,55 @@ pub fn default_deepseek_key_path() -> Option<PathBuf> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepInfraProviderConfig {
+    #[serde(default = "default_deepinfra_name")]
+    pub name: String,
+
+    /// API key. Supports "env:VAR_NAME" syntax.
+    pub api_key: Option<String>,
+
+    /// Path to a file containing the API key (written by `llm-gateway login deepinfra`).
+    /// Used as a fallback when `api_key` is not set. Defaults to
+    /// ~/.config/llm-gateway/deepinfra-key.txt
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
+
+    #[serde(default = "default_deepinfra_api_base")]
+    pub api_base: String,
+
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+impl DeepInfraProviderConfig {
+    /// Resolve the effective API key: prefer `api_key`, else read `api_key_file`
+    /// (or the default key path).
+    pub fn resolve_key(&self) -> Option<String> {
+        if let Some(key) = &self.api_key {
+            if !key.is_empty() {
+                return Some(key.clone());
+            }
+        }
+        let path = self
+            .api_key_file
+            .clone()
+            .or_else(default_deepinfra_key_path)?;
+        let contents = std::fs::read_to_string(path).ok()?;
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+}
+
+/// Default path for the DeepInfra API key file.
+pub fn default_deepinfra_key_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("llm-gateway").join("deepinfra-key.txt"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenaiCompatibleProviderConfig {
     pub name: String,
 
@@ -304,6 +355,12 @@ fn default_deepseek_name() -> String {
 fn default_deepseek_api_base() -> String {
     "https://api.deepseek.com/v1".to_string()
 }
+fn default_deepinfra_name() -> String {
+    "deepinfra".to_string()
+}
+fn default_deepinfra_api_base() -> String {
+    "https://api.deepinfra.com/v1/openai".to_string()
+}
 
 impl GatewayConfig {
     /// Load config from a JSON file path.
@@ -337,6 +394,9 @@ impl GatewayConfig {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::DeepSeek(cfg) => {
+                    cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
+                }
+                ProviderConfig::DeepInfra(cfg) => {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::Chatgpt(_) => {

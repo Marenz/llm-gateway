@@ -119,6 +119,7 @@ curl -s http://127.0.0.1:4000/health   # {"status":"ok"}
 | OpenCode Go | API key (subscription) | `opencode_go` |
 | OpenCode Zen | API key (subscription) | `zen` |
 | DeepSeek | API key | `deep_seek` |
+| DeepInfra | API key | `deep_infra` |
 | Generic | API key + custom header | `openai_compatible` |
 
 ## Virtual Models (failover chains)

@@ -80,6 +80,15 @@ enum LoginProvider {
         #[arg(long)]
         key_file: Option<PathBuf>,
     },
+    /// Store a DeepInfra API key (paste it when prompted)
+    Deepinfra {
+        /// API key to store. If omitted, you'll be prompted to paste it.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Path to save the key (default: ~/.config/llm-gateway/deepinfra-key.txt)
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -261,6 +270,66 @@ async fn handle_login(provider: LoginProvider, config_path: &str) -> anyhow::Res
             } else if loaded_config.is_none() && std::env::var("DEEPSEEK_API_KEY").is_ok() {
                 eprintln!(
                     "warning: this key may have NO EFFECT — DEEPSEEK_API_KEY is set in the \
+                     environment and takes precedence over the key file."
+                );
+            } else {
+                println!("Restart the gateway to pick up the new key.");
+            }
+        }
+
+        LoginProvider::Deepinfra { api_key, key_file } => {
+            let key_path = key_file
+                .or_else(config::default_deepinfra_key_path)
+                .ok_or_else(|| anyhow::anyhow!("could not determine config dir for key file"))?;
+
+            let key = match api_key {
+                Some(key) => key,
+                None => {
+                    eprint!("Paste your DeepInfra API key: ");
+                    std::io::Write::flush(&mut std::io::stderr()).ok();
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .read_line(&mut input)
+                        .context("failed to read input")?;
+                    input.trim().to_string()
+                }
+            };
+
+            if key.is_empty() {
+                anyhow::bail!("no API key provided");
+            }
+
+            if let Some(parent) = key_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&key_path, format!("{key}\n"))
+                .with_context(|| format!("failed to write {}", key_path.display()))?;
+
+            // Restrict permissions to the user (0600) on Unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+
+            println!("DeepInfra API key saved to {}", key_path.display());
+
+            // Warn if a higher-precedence key will shadow this one.
+            let shadowed_by_config = loaded_config.as_ref().is_some_and(|cfg| {
+                cfg.providers.iter().any(|p| {
+                    matches!(p, config::ProviderConfig::DeepInfra(c)
+                        if c.api_key.as_ref().is_some_and(|k| !k.is_empty()))
+                })
+            });
+            if shadowed_by_config {
+                eprintln!(
+                    "warning: this key will have NO EFFECT — the DeepInfra provider in {config_path} \
+                     already has `api_key` set, which takes precedence over the key file. \
+                     Remove `api_key` (or set it to \"env:DEEPINFRA_API_KEY\") to use the saved key."
+                );
+            } else if loaded_config.is_none() && std::env::var("DEEPINFRA_API_KEY").is_ok() {
+                eprintln!(
+                    "warning: this key may have NO EFFECT — DEEPINFRA_API_KEY is set in the \
                      environment and takes precedence over the key file."
                 );
             } else {
@@ -481,6 +550,16 @@ async fn handle_status(config_path: &str) -> anyhow::Result<()> {
                     println!("no api key (run: llm-gateway login deepseek)");
                 }
             }
+            config::ProviderConfig::DeepInfra(cfg) => {
+                print!("  deepinfra ({}): ", cfg.name);
+                if cfg.api_key.is_some() {
+                    println!("api key configured");
+                } else if cfg.resolve_key().is_some() {
+                    println!("api key configured (from key file)");
+                } else {
+                    println!("no api key (run: llm-gateway login deepinfra)");
+                }
+            }
         }
     }
 
@@ -572,6 +651,18 @@ fn default_config() -> config::GatewayConfig {
             api_key: std::env::var("DEEPSEEK_API_KEY").ok(),
             api_key_file: None,
             api_base: "https://api.deepseek.com/v1".to_string(),
+            models: vec![],
+        },
+    ));
+
+    // Always register DeepInfra: the env var is optional, since the key may have
+    // been stored via `llm-gateway login deepinfra` (read from the key file).
+    providers.push(config::ProviderConfig::DeepInfra(
+        config::DeepInfraProviderConfig {
+            name: "deepinfra".to_string(),
+            api_key: std::env::var("DEEPINFRA_API_KEY").ok(),
+            api_key_file: None,
+            api_base: "https://api.deepinfra.com/v1/openai".to_string(),
             models: vec![],
         },
     ));
