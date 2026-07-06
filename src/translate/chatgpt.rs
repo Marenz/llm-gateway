@@ -60,9 +60,13 @@ pub fn to_responses_request(req: &OpenAIRequest) -> Value {
     if let Some(effort) = &req.reasoning_effort {
         obj.insert(
             "reasoning".into(),
+            // No "summary" key: requesting summaries ("auto") makes the
+            // backend emit reasoning-summary text that also arrives as
+            // response.output_text.delta events and gets concatenated with
+            // the final answer (duplicated-text bug). "none" is rejected
+            // by the API, so omit the key entirely.
             json!({
-                "effort": effort,
-                "summary": "auto"
+                "effort": effort
             }),
         );
         // reasoning models don't support temperature/top_p
@@ -72,9 +76,9 @@ pub fn to_responses_request(req: &OpenAIRequest) -> Value {
         // default reasoning for gpt-5.* models
         obj.insert(
             "reasoning".into(),
+            // No "summary" key: see comment above (duplicated-text bug).
             json!({
-                "effort": "medium",
-                "summary": "auto"
+                "effort": "medium"
             }),
         );
         obj.remove("temperature");
