@@ -56,12 +56,29 @@ enum LoginProvider {
         /// Path to save the OAuth tokens (default: ~/.config/llm-gateway/anthropic-oauth.json)
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// Only print the authorization URL; do not try to open a browser
+        /// (useful on headless/remote machines)
+        #[arg(long)]
+        show_url_only: bool,
     },
     /// Run the ChatGPT/OpenAI device code OAuth flow
     Chatgpt {
         /// Path to save the auth tokens
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// Only print the authorization URL; do not try to open a browser
+        /// (useful on headless/remote machines)
+        #[arg(long)]
+        show_url_only: bool,
+    },
+    /// Store a DeepSeek API key (paste it when prompted)
+    Deepseek {
+        /// API key to store. If omitted, you'll be prompted to paste it.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Path to save the key (default: ~/.config/llm-gateway/deepseek-key.txt)
+        #[arg(long)]
+        key_file: Option<PathBuf>,
     },
 }
 
@@ -84,18 +101,37 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = cli.config.unwrap_or_else(default_config_path);
     match cli.command {
-        Some(Command::Login { provider }) => handle_login(provider).await,
+        Some(Command::Login { provider }) => handle_login(provider, &config_path).await,
         Some(Command::Status) => handle_status(&config_path).await,
         Some(Command::Serve { host, port }) => handle_serve(&config_path, host, port).await,
         None => handle_serve(&config_path, None, None).await,
     }
 }
 
-async fn handle_login(provider: LoginProvider) -> anyhow::Result<()> {
+async fn handle_login(provider: LoginProvider, config_path: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
 
+    // Load the effective config (if any) so we can warn when a login won't take effect.
+    let loaded_config = {
+        let path = std::path::Path::new(config_path);
+        if path.exists() {
+            match config::GatewayConfig::from_file(path) {
+                Ok(mut cfg) => {
+                    cfg.resolve_env_vars();
+                    Some(cfg)
+                }
+                Err(err) => {
+                    eprintln!("warning: could not read config at {config_path}: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     match provider {
-        LoginProvider::Anthropic { token_file } => {
+        LoginProvider::Anthropic { token_file, show_url_only } => {
             let token_path = token_file.unwrap_or_else(default_anthropic_token_path);
             let store = oauth::token_store::TokenStore::new(token_path.clone());
 
@@ -108,6 +144,7 @@ async fn handle_login(provider: LoginProvider) -> anyhow::Result<()> {
 
             println!("Open this URL in your browser:\n");
             println!("  {auth_url}\n");
+            open_browser(&auth_url, show_url_only);
             println!("After authorizing, you'll be redirected to a page showing a code.");
             println!("The URL will look like:  ...callback?code=CODE#STATE");
             println!("Paste the full 'code#state' value below.\n");
@@ -136,6 +173,8 @@ async fn handle_login(provider: LoginProvider) -> anyhow::Result<()> {
             store.save(&tokens).await?;
             println!("Anthropic OAuth tokens saved to {}", token_path.display());
 
+            warn_anthropic_no_effect(loaded_config.as_ref(), &token_path, config_path);
+
             if let Some(expires_at) = tokens.expires_at {
                 let hours = (expires_at - now_millis()) / 1000 / 3600;
                 println!("Token expires in ~{hours} hours");
@@ -145,19 +184,21 @@ async fn handle_login(provider: LoginProvider) -> anyhow::Result<()> {
             }
         }
 
-        LoginProvider::Chatgpt { token_file } => {
+        LoginProvider::Chatgpt { token_file, show_url_only } => {
             let token_path = token_file.unwrap_or_else(default_chatgpt_token_path);
             let store = oauth::token_store::TokenStore::new(token_path.clone());
 
             println!("Starting ChatGPT OAuth flow...\n");
 
-            let tokens = oauth::chatgpt::login_browser(&client).await?;
+            let tokens = oauth::chatgpt::login_browser(&client, show_url_only).await?;
 
             if let Some(parent) = token_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             store.save(&tokens).await?;
             println!("\nChatGPT OAuth tokens saved to {}", token_path.display());
+
+            warn_chatgpt_no_effect(loaded_config.as_ref(), &token_path, config_path);
 
             if let Some(account_id) = tokens.extra.get("account_id") {
                 println!("Account ID: {account_id}");
@@ -166,9 +207,156 @@ async fn handle_login(provider: LoginProvider) -> anyhow::Result<()> {
                 println!("Refresh token stored — tokens will auto-refresh");
             }
         }
+
+        LoginProvider::Deepseek { api_key, key_file } => {
+            let key_path = key_file
+                .or_else(config::default_deepseek_key_path)
+                .ok_or_else(|| anyhow::anyhow!("could not determine config dir for key file"))?;
+
+            let key = match api_key {
+                Some(key) => key,
+                None => {
+                    eprint!("Paste your DeepSeek API key: ");
+                    std::io::Write::flush(&mut std::io::stderr()).ok();
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .read_line(&mut input)
+                        .context("failed to read input")?;
+                    input.trim().to_string()
+                }
+            };
+
+            if key.is_empty() {
+                anyhow::bail!("no API key provided");
+            }
+
+            if let Some(parent) = key_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&key_path, format!("{key}\n"))
+                .with_context(|| format!("failed to write {}", key_path.display()))?;
+
+            // Restrict permissions to the user (0600) on Unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+
+            println!("DeepSeek API key saved to {}", key_path.display());
+
+            // Warn if a higher-precedence key will shadow this one.
+            let shadowed_by_config = loaded_config.as_ref().is_some_and(|cfg| {
+                cfg.providers.iter().any(|p| {
+                    matches!(p, config::ProviderConfig::DeepSeek(c)
+                        if c.api_key.as_ref().is_some_and(|k| !k.is_empty()))
+                })
+            });
+            if shadowed_by_config {
+                eprintln!(
+                    "warning: this key will have NO EFFECT — the DeepSeek provider in {config_path} \
+                     already has `api_key` set, which takes precedence over the key file. \
+                     Remove `api_key` (or set it to \"env:DEEPSEEK_API_KEY\") to use the saved key."
+                );
+            } else if loaded_config.is_none() && std::env::var("DEEPSEEK_API_KEY").is_ok() {
+                eprintln!(
+                    "warning: this key may have NO EFFECT — DEEPSEEK_API_KEY is set in the \
+                     environment and takes precedence over the key file."
+                );
+            } else {
+                println!("Restart the gateway to pick up the new key.");
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Warn if Anthropic OAuth tokens just saved won't be used by the gateway.
+fn warn_anthropic_no_effect(
+    config: Option<&config::GatewayConfig>,
+    saved_path: &std::path::Path,
+    config_path: &str,
+) {
+    let Some(config) = config else {
+        // No config file → default_config() always registers Anthropic at the
+        // default token path, so a default-path save is fine.
+        return;
+    };
+    let provider = config.providers.iter().find_map(|p| match p {
+        config::ProviderConfig::Anthropic(c) => Some(c),
+        _ => None,
+    });
+    let Some(provider) = provider else {
+        eprintln!(
+            "warning: this login will have NO EFFECT — no `anthropic` provider is configured \
+             in {config_path}, so the gateway will never load these tokens."
+        );
+        return;
+    };
+    let expected = provider.oauth_token_file.clone().unwrap_or_else(default_anthropic_token_path);
+    if !same_path(&expected, saved_path) {
+        eprintln!(
+            "warning: this login may have NO EFFECT — the `anthropic` provider in {config_path} \
+             reads tokens from {}, but they were saved to {}. Use --token-file {} (or update the \
+             config's `oauth_token_file`).",
+            expected.display(),
+            saved_path.display(),
+            expected.display(),
+        );
+    }
+}
+
+/// Warn if ChatGPT OAuth tokens just saved won't be used by the gateway.
+fn warn_chatgpt_no_effect(
+    config: Option<&config::GatewayConfig>,
+    saved_path: &std::path::Path,
+    config_path: &str,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    let provider = config.providers.iter().find_map(|p| match p {
+        config::ProviderConfig::Chatgpt(c) => Some(c),
+        _ => None,
+    });
+    let Some(provider) = provider else {
+        eprintln!(
+            "warning: this login will have NO EFFECT — no `chatgpt` provider is configured \
+             in {config_path}, so the gateway will never load these tokens."
+        );
+        return;
+    };
+    let expected = provider.token_file.clone().unwrap_or_else(default_chatgpt_token_path);
+    if !same_path(&expected, saved_path) {
+        eprintln!(
+            "warning: this login may have NO EFFECT — the `chatgpt` provider in {config_path} \
+             reads tokens from {}, but they were saved to {}. Use --token-file {} (or update the \
+             config's `token_file`).",
+            expected.display(),
+            saved_path.display(),
+            expected.display(),
+        );
+    }
+}
+
+/// Compare two paths, canonicalizing where possible so relative/symlinked paths
+/// that point to the same file are treated as equal.
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+/// Try to open the given URL in the user's browser unless `show_url_only` is set.
+fn open_browser(url: &str, show_url_only: bool) {
+    if show_url_only {
+        println!("(--show-url-only set — not opening a browser)");
+        return;
+    }
+    match std::process::Command::new("xdg-open").arg(url).spawn() {
+        Ok(_) => println!("Opening browser..."),
+        Err(_) => println!("(could not auto-open browser — open the URL above manually)"),
+    }
 }
 
 async fn handle_status(config_path: &str) -> anyhow::Result<()> {
@@ -287,8 +475,10 @@ async fn handle_status(config_path: &str) -> anyhow::Result<()> {
                 print!("  deepseek ({}): ", cfg.name);
                 if cfg.api_key.is_some() {
                     println!("api key configured");
+                } else if cfg.resolve_key().is_some() {
+                    println!("api key configured (from key file)");
                 } else {
-                    println!("no api key");
+                    println!("no api key (run: llm-gateway login deepseek)");
                 }
             }
         }
@@ -374,16 +564,17 @@ fn default_config() -> config::GatewayConfig {
         ));
     }
 
-    if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
-        providers.push(config::ProviderConfig::DeepSeek(
-            config::DeepSeekProviderConfig {
-                name: "deepseek".to_string(),
-                api_key: Some(key),
-                api_base: "https://api.deepseek.com/v1".to_string(),
-                models: vec![],
-            },
-        ));
-    }
+    // Always register DeepSeek: the env var is optional, since the key may have
+    // been stored via `llm-gateway login deepseek` (read from the key file).
+    providers.push(config::ProviderConfig::DeepSeek(
+        config::DeepSeekProviderConfig {
+            name: "deepseek".to_string(),
+            api_key: std::env::var("DEEPSEEK_API_KEY").ok(),
+            api_key_file: None,
+            api_base: "https://api.deepseek.com/v1".to_string(),
+            models: vec![],
+        },
+    ));
 
     providers.push(config::ProviderConfig::Chatgpt(
         config::ChatgptProviderConfig {

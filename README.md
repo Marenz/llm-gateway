@@ -49,6 +49,28 @@ llm-gateway login chatgpt
 # requires ChatGPT Plus/Pro/Max subscription
 ```
 
+Both `login anthropic` and `login chatgpt` try to open your browser
+automatically. On a headless or remote machine, pass `--show-url-only` to just
+print the authorization URL (no browser launch):
+
+```bash
+llm-gateway login chatgpt --show-url-only
+llm-gateway login anthropic --show-url-only
+```
+
+### DeepSeek
+
+```bash
+llm-gateway login deepseek
+# paste your API key when prompted
+# saved to ~/.config/llm-gateway/deepseek-key.txt (chmod 600)
+# or non-interactively:
+llm-gateway login deepseek --api-key sk-...
+```
+
+Restart the gateway afterwards to pick up the new key. `DEEPSEEK_API_KEY` and
+`api_key` in `config.json` still work and take precedence over the key file.
+
 ### XiaoMiMo / OpenAI / OpenCode Go
 
 Set `XIAOMI_MIMO_API_KEY` / `OPENAI_API_KEY` / `OPENCODE_GO_API_KEY`, or configure `api_key` in `config.json`.

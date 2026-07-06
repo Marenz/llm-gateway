@@ -272,7 +272,10 @@ fn decode_jwt_payload(token: &str) -> Option<Value> {
 
 /// Full browser-based OAuth flow: spins up a local server on port 1455,
 /// builds the authorize URL with PKCE, opens the browser, and waits for the callback.
-pub async fn login_browser(http_client: &reqwest::Client) -> anyhow::Result<OAuthTokens> {
+pub async fn login_browser(
+    http_client: &reqwest::Client,
+    show_url_only: bool,
+) -> anyhow::Result<OAuthTokens> {
     use rand::RngCore;
     use sha2::{Digest, Sha256};
     use tokio::sync::oneshot;
@@ -307,46 +310,30 @@ pub async fn login_browser(http_client: &reqwest::Client) -> anyhow::Result<OAut
         url.to_string()
     };
 
-    // Channel to receive the callback result
-    let (tx, rx) = oneshot::channel::<anyhow::Result<(String, String)>>(); // (code, returned_state)
-    let tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
-    let state_clone = state.clone();
-    let tx_clone = tx.clone();
-
-    // Start local HTTP server
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", OAUTH_REDIRECT_PORT))
-        .await
-        .with_context(|| format!("failed to bind localhost:{OAUTH_REDIRECT_PORT} for OAuth callback — is another instance running?"))?;
-
-    let server = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else { break };
-            let tx = tx_clone.clone();
-            let state = state_clone.clone();
-            tokio::spawn(async move {
-                handle_oauth_callback(stream, tx, &state).await;
-            });
-        }
-    });
-
     println!("Open this URL in your browser:\n");
     println!("  {auth_url}\n");
-    println!("Waiting for authorization (will open automatically if possible)...");
 
-    // Try to open browser automatically
-    let _ = std::process::Command::new("xdg-open").arg(&auth_url).spawn();
+    // In show-url-only mode the browser is (typically) on a different machine, so
+    // the localhost:1455 redirect can't reach us. Ask the user to paste the value
+    // they're redirected to back into this terminal instead.
+    let (code, returned_state) = if show_url_only {
+        println!("(--show-url-only set — not opening a browser, not listening for a callback)");
+        prompt_for_pasted_callback().await?
+    } else {
+        match std::process::Command::new("xdg-open").arg(&auth_url).spawn() {
+            Ok(_) => println!("Opening browser..."),
+            Err(_) => println!("(could not auto-open browser — open the URL above manually)"),
+        }
+        println!("Waiting for authorization callback on localhost:{OAUTH_REDIRECT_PORT}... (Ctrl+C to cancel)");
+        wait_for_callback(&state).await?
+    };
 
-    // Wait for callback (5 minute timeout)
-    let result = tokio::time::timeout(Duration::from_secs(300), rx)
-        .await
-        .context("timed out waiting for OAuth callback")?
-        .context("OAuth callback channel closed")?;
-
-    server.abort();
-
-    let (code, returned_state) = result?;
-    if returned_state != state {
+    // Validate state when we got one back. In show-url-only mode the user may
+    // paste a bare code with no state; we can't verify CSRF then, so we warn
+    // instead of failing.
+    if returned_state.is_empty() {
+        eprintln!("warning: no `state` in pasted value — skipping CSRF check");
+    } else if returned_state != state {
         anyhow::bail!("OAuth state mismatch — possible CSRF");
     }
 
@@ -362,6 +349,119 @@ pub async fn login_browser(http_client: &reqwest::Client) -> anyhow::Result<OAut
         &redirect_uri,
     )
     .await
+}
+
+/// Run the local callback server and wait for the OAuth redirect, racing against
+/// Ctrl+C so the user can cancel. Returns (code, returned_state).
+async fn wait_for_callback(state: &str) -> anyhow::Result<(String, String)> {
+    use tokio::sync::oneshot;
+
+    let (tx, rx) = oneshot::channel::<anyhow::Result<(String, String)>>();
+    let tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", OAUTH_REDIRECT_PORT))
+        .await
+        .with_context(|| format!("failed to bind localhost:{OAUTH_REDIRECT_PORT} for OAuth callback — is another instance running?"))?;
+
+    let state_owned = state.to_string();
+    let tx_clone = tx.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let tx = tx_clone.clone();
+            let state = state_owned.clone();
+            tokio::spawn(async move {
+                handle_oauth_callback(stream, tx, &state).await;
+            });
+        }
+    });
+
+    // Race the callback against a timeout and Ctrl+C.
+    let result = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {
+            server.abort();
+            anyhow::bail!("cancelled (Ctrl+C)");
+        }
+        timed = tokio::time::timeout(Duration::from_secs(300), rx) => {
+            server.abort();
+            timed
+                .context("timed out waiting for OAuth callback")?
+                .context("OAuth callback channel closed")?
+        }
+    };
+
+    result
+}
+
+/// Prompt the user to paste the value they were redirected to (full URL,
+/// `code#state`, or just the `code`) and parse out (code, state).
+async fn prompt_for_pasted_callback() -> anyhow::Result<(String, String)> {
+    println!(
+        "\nAfter authorizing, your browser is redirected to a URL like:\n  \
+         http://localhost:{OAUTH_REDIRECT_PORT}/auth/callback?code=...&state=...\n\
+         The page won't load (this machine isn't the browser's localhost) — that's fine.\n\
+         Copy that URL from the address bar and paste it here.\n"
+    );
+
+    // Read a line from stdin without blocking the Ctrl+C signal handler.
+    let line = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => anyhow::bail!("cancelled (Ctrl+C)"),
+        line = read_line_async("paste redirect URL (or code#state)> ") => line?,
+    };
+
+    parse_pasted_callback(&line)
+}
+
+/// Parse a pasted callback value into (code, state). Accepts a full URL,
+/// `code#state`, `code&state=...`, or a bare code (state defaults to empty,
+/// which the caller treats as a match only if its own state is empty).
+fn parse_pasted_callback(input: &str) -> anyhow::Result<(String, String)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("no input provided");
+    }
+
+    // Full URL with query params.
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        if url.query().is_some() || url.scheme().starts_with("http") {
+            let params: HashMap<_, _> = url.query_pairs().collect();
+            if let Some(err) = params.get("error") {
+                anyhow::bail!("authorization failed: {err}");
+            }
+            let code = params
+                .get("code")
+                .map(|c| c.to_string())
+                .ok_or_else(|| anyhow!("no `code` parameter found in pasted URL"))?;
+            let state = params.get("state").map(|s| s.to_string()).unwrap_or_default();
+            return Ok((code, state));
+        }
+    }
+
+    // `code#state` (mirrors the Anthropic flow).
+    if let Some((code, state)) = trimmed.split_once('#') {
+        return Ok((code.to_string(), state.to_string()));
+    }
+
+    // Bare code, no state.
+    Ok((trimmed.to_string(), String::new()))
+}
+
+/// Read a single line from stdin on a blocking thread so it can be raced in `select!`.
+async fn read_line_async(prompt: &str) -> anyhow::Result<String> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    tokio::task::spawn_blocking(|| {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_line(&mut buf)
+            .context("failed to read input")?;
+        Ok::<_, anyhow::Error>(buf)
+    })
+    .await
+    .context("stdin read task failed")?
 }
 
 async fn handle_oauth_callback(
@@ -421,4 +521,51 @@ async fn handle_oauth_callback(
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pasted_callback;
+
+    #[test]
+    fn parses_full_redirect_url() {
+        let (code, state) = parse_pasted_callback(
+            "http://localhost:1455/auth/callback?code=abc123&state=xyz",
+        )
+        .unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state, "xyz");
+    }
+
+    #[test]
+    fn parses_code_hash_state() {
+        let (code, state) = parse_pasted_callback("abc123#xyz").unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state, "xyz");
+    }
+
+    #[test]
+    fn parses_bare_code_with_empty_state() {
+        let (code, state) = parse_pasted_callback("  abc123  ").unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state, "");
+    }
+
+    #[test]
+    fn empty_input_errors() {
+        assert!(parse_pasted_callback("   ").is_err());
+    }
+
+    #[test]
+    fn url_with_error_param_errors() {
+        assert!(parse_pasted_callback(
+            "http://localhost:1455/auth/callback?error=access_denied"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn url_without_code_errors() {
+        assert!(parse_pasted_callback("http://localhost:1455/auth/callback?state=xyz").is_err());
+    }
 }

@@ -189,11 +189,45 @@ pub struct DeepSeekProviderConfig {
     /// API key. Supports "env:VAR_NAME" syntax.
     pub api_key: Option<String>,
 
+    /// Path to a file containing the API key (written by `llm-gateway login deepseek`).
+    /// Used as a fallback when `api_key` is not set. Defaults to
+    /// ~/.config/llm-gateway/deepseek-key.txt
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
+
     #[serde(default = "default_deepseek_api_base")]
     pub api_base: String,
 
     #[serde(default)]
     pub models: Vec<String>,
+}
+
+impl DeepSeekProviderConfig {
+    /// Resolve the effective API key: prefer `api_key`, else read `api_key_file`
+    /// (or the default key path).
+    pub fn resolve_key(&self) -> Option<String> {
+        if let Some(key) = &self.api_key {
+            if !key.is_empty() {
+                return Some(key.clone());
+            }
+        }
+        let path = self
+            .api_key_file
+            .clone()
+            .or_else(default_deepseek_key_path)?;
+        let contents = std::fs::read_to_string(path).ok()?;
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+}
+
+/// Default path for the DeepSeek API key file.
+pub fn default_deepseek_key_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("llm-gateway").join("deepseek-key.txt"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

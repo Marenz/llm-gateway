@@ -64,6 +64,50 @@ src/
 - `POST /v1/messages` — Anthropic Messages API passthrough
 - `GET /v1/models` — List available models
 
+## Login / Auth CLI
+
+- `login anthropic` and `login chatgpt` both auto-open the browser via `xdg-open`
+  by default. Pass `--show-url-only` to skip the browser and just print the URL
+  (headless/remote use). The shared `open_browser(url, show_url_only)` helper in
+  `main.rs` handles this for Anthropic; `chatgpt::login_browser` takes a
+  `show_url_only: bool`.
+  - **Default ChatGPT mode** runs a local callback server on port 1455 and
+    `wait_for_callback` races it against `tokio::signal::ctrl_c()` + a 5-min
+    timeout, so Ctrl+C cancels cleanly (the old code blocked on the channel and
+    ignored SIGINT).
+  - **`--show-url-only` ChatGPT mode** does NOT bind a callback server (the
+    browser is on another machine, so `localhost:1455` can't reach this host).
+    Instead `prompt_for_pasted_callback` asks the user to paste the redirect URL
+    (or `code#state`, or a bare `code`); `parse_pasted_callback` extracts
+    `(code, state)`. A bare code skips the CSRF/state check with a warning.
+  - Anthropic always requires a manual `code#state` paste (hosted redirect at
+    `console.anthropic.com`).
+- `login deepseek` stores a pasted API key to `~/.config/llm-gateway/deepseek-key.txt`
+  (chmod 0600). `DeepSeekProviderConfig::resolve_key()` prefers `api_key`, then
+  falls back to `api_key_file` (or the default key path). DeepSeek is now always
+  registered in `default_config()` so the key file is picked up even without
+  `DEEPSEEK_API_KEY`.
+- **No-effect warnings:** `handle_login` loads the effective config and warns (to
+  stderr) when a just-completed login won't be used by the gateway:
+  - DeepSeek: a configured `api_key` (or `DEEPSEEK_API_KEY`) shadows the key file.
+  - Anthropic/ChatGPT: the provider isn't present in the config at all, or the
+    `--token-file` save path differs from the provider's configured
+    `oauth_token_file`/`token_file` (compared via `same_path`, which canonicalizes).
+  - With no config file present, `default_config()` registers all providers at
+    default paths, so default-path saves never warn.
+
+## Local deployment
+
+Installed binary lives at `~/.cargo/bin/llm-gateway`, run as the
+`llm-gateway.service` **systemd --user** unit (config at
+`~/.config/llm-gateway/config.json`). To deploy changes:
+
+```bash
+cargo install --path . --force
+systemctl --user restart llm-gateway.service
+curl -s http://127.0.0.1:4000/health   # {"status":"ok"}
+```
+
 ## Providers
 
 | Provider | Auth | Config type |

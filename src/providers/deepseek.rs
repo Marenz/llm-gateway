@@ -14,10 +14,11 @@ pub struct DeepSeekProvider {
 
 impl DeepSeekProvider {
     pub fn new(config: DeepSeekProviderConfig) -> Self {
+        let api_key = config.resolve_key();
         Self {
             name: config.name,
             api_base: config.api_base,
-            api_key: config.api_key,
+            api_key,
             client: Client::new(),
         }
     }
