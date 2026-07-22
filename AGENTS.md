@@ -2,7 +2,7 @@
 
 ## Overview
 
-Generic LLM proxy/router in Rust. Exposes a unified OpenAI-compatible API (`/v1/chat/completions`) that routes to multiple backend providers: Anthropic, OpenAI/ChatGPT (OAuth), XiaoMiMo, and any OpenAI-compatible endpoint.
+Generic LLM proxy/router in Rust. Exposes a unified OpenAI-compatible API (`/v1/chat/completions`) that routes to multiple backend providers: Anthropic, OpenAI/ChatGPT (OAuth), XiaoMiMo, Moonshot AI, and any OpenAI-compatible endpoint.
 
 Ported from [anthropic-max-router](https://github.com/Nayjest/lm-proxy) (TypeScript) with a generic multi-provider architecture.
 
@@ -95,6 +95,11 @@ src/
     `oauth_token_file`/`token_file` (compared via `same_path`, which canonicalizes).
   - With no config file present, `default_config()` registers all providers at
     default paths, so default-path saves never warn.
+- `login moonshot` stores a pasted API key at
+  `~/.config/llm-gateway/moonshot-key.txt` (chmod 0600). The dedicated
+  `moonshot` provider defaults to `https://api.moonshot.ai/v1`, is registered
+  by `default_config()`, and routes `moonshot/*` through the shared
+  OpenAI-compatible proxy.
 
 ## Local deployment
 
@@ -120,6 +125,7 @@ curl -s http://127.0.0.1:4000/health   # {"status":"ok"}
 | OpenCode Zen | API key (subscription) | `zen` |
 | DeepSeek | API key | `deep_seek` |
 | DeepInfra | API key | `deep_infra` |
+| Moonshot AI | API key | `moonshot` |
 | Generic | API key + custom header | `openai_compatible` |
 
 ## Virtual Models (failover chains)

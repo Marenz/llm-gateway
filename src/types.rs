@@ -453,6 +453,7 @@ pub enum ProviderKind {
     Zen,
     DeepSeek,
     DeepInfra,
+    Moonshot,
 }
 
 #[derive(Debug, Clone)]

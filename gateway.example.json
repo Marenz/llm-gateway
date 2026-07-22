@@ -52,6 +52,15 @@
         "deepseek-v4-flash",
         "deepseek-v4-pro"
       ]
+    },
+    {
+      "type": "moonshot",
+      "name": "moonshot",
+      "api_key": "env:MOONSHOT_API_KEY",
+      "api_base": "https://api.moonshot.ai/v1",
+      "models": [
+        "kimi-k3"
+      ]
     }
   ],
   "virtual_models": {
@@ -66,6 +75,7 @@
     "deepseek-v4-pro": "deepseek/deepseek-v4-pro",
     "deepseek-chat": "deepseek/deepseek-v4-flash",
     "deepseek-reasoner": "deepseek/deepseek-v4-flash",
-    "deepseek-thinking": "deepseek/deepseek-v4-pro"
+    "deepseek-thinking": "deepseek/deepseek-v4-pro",
+    "kimi3": "moonshot/kimi-k3"
   }
 }

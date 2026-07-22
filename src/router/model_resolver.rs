@@ -120,6 +120,17 @@ impl ModelResolver {
                         });
                     }
                 }
+                ProviderConfig::Moonshot(cfg) => {
+                    implicit.moonshot.get_or_insert_with(|| cfg.name.clone());
+                    for model in &cfg.models {
+                        routes.push(ModelRoute {
+                            pattern: model.clone(),
+                            provider_kind: ProviderKind::Moonshot,
+                            provider_name: cfg.name.clone(),
+                            strip_prefix: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -201,6 +212,15 @@ impl ModelResolver {
             });
         }
 
+        if let Some(provider_name) = implicit.moonshot {
+            routes.push(ModelRoute {
+                pattern: "moonshot/".to_string(),
+                provider_kind: ProviderKind::Moonshot,
+                provider_name,
+                strip_prefix: Some("moonshot/".to_string()),
+            });
+        }
+
         Self {
             routes,
             aliases: config.model_aliases.clone(),
@@ -238,4 +258,43 @@ struct ImplicitProviders {
     zen: Option<String>,
     deepseek: Option<String>,
     deepinfra: Option<String>,
+    moonshot: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> GatewayConfig {
+        serde_json::from_str(
+            r#"{
+                "providers": [{
+                    "type": "moonshot",
+                    "api_key": null,
+                    "models": ["kimi-k3"]
+                }],
+                "model_aliases": {"kimi3": "moonshot/kimi-k3"}
+            }"#,
+        )
+        .expect("valid config")
+    }
+
+    #[test]
+    fn resolves_moonshot_prefix() {
+        let resolved = ModelResolver::from_config(&config())
+            .resolve("moonshot/kimi-k3")
+            .expect("route should resolve");
+        assert_eq!(resolved.provider_kind, ProviderKind::Moonshot);
+        assert_eq!(resolved.provider_name, "moonshot");
+        assert_eq!(resolved.upstream_model, "kimi-k3");
+    }
+
+    #[test]
+    fn resolves_moonshot_alias() {
+        let resolved = ModelResolver::from_config(&config())
+            .resolve("kimi3")
+            .expect("alias should resolve");
+        assert_eq!(resolved.provider_kind, ProviderKind::Moonshot);
+        assert_eq!(resolved.upstream_model, "kimi-k3");
+    }
 }

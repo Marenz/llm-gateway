@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use crate::config::{
     AnthropicProviderConfig, ChatgptProviderConfig, GatewayConfig, OpenaiCompatibleProviderConfig,
-    OpenaiProviderConfig, OpencodeGoProviderConfig, ProviderConfig, XiaomiMimoProviderConfig,
+    MoonshotProviderConfig, OpenaiProviderConfig, OpencodeGoProviderConfig, ProviderConfig,
+    XiaomiMimoProviderConfig,
 };
 use crate::oauth;
 use crate::providers::deepseek::DeepSeekProvider;
@@ -126,6 +127,12 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
             }
             ProviderConfig::DeepInfra(cfg) => {
                 deepinfra = Some(DeepInfraProvider::new(cfg.clone()));
+            }
+            ProviderConfig::Moonshot(cfg) => {
+                openai_compat_providers.insert(
+                    cfg.name.clone(),
+                    OpenAICompatProvider::from_moonshot(cfg.clone()),
+                );
             }
         }
     }
@@ -504,7 +511,10 @@ async fn dispatch_resolved(
                 }
             }
         }
-        ProviderKind::Openai | ProviderKind::XiaomiMimo | ProviderKind::OpenaiCompatible => {
+        ProviderKind::Openai
+        | ProviderKind::XiaomiMimo
+        | ProviderKind::OpenaiCompatible
+        | ProviderKind::Moonshot => {
             let Some(provider) = state.openai_compat_providers.get(&resolved.provider_name) else {
                 return error_response(StatusCode::BAD_GATEWAY, "provider not configured");
             };
@@ -1728,6 +1738,17 @@ impl OpenAICompatProvider {
             name: config.name,
             api_base: config.api_base,
             api_key: config.api_key,
+            auth_header: None,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn from_moonshot(config: MoonshotProviderConfig) -> Self {
+        let api_key = config.resolve_key();
+        Self {
+            name: config.name,
+            api_base: config.api_base,
+            api_key,
             auth_header: None,
             client: reqwest::Client::new(),
         }

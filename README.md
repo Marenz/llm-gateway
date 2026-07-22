@@ -12,6 +12,7 @@ A generic LLM proxy/router written in Rust. Exposes a unified OpenAI-compatible 
 | **XiaoMiMo** | API key | `mimo/` |
 | **OpenCode Go** | API key (subscription) | `opencode-go/` |
 | **OpenAI** | API key | `openai/` |
+| **Moonshot AI** | API key | `moonshot/` |
 | **Generic** | API key + custom header | configured name |
 
 Models are discovered live from each provider's API at startup — no hardcoded lists needed.
@@ -77,6 +78,16 @@ Set `XIAOMI_MIMO_API_KEY` / `OPENAI_API_KEY` / `OPENCODE_GO_API_KEY`, or configu
 
 [OpenCode Go](https://opencode.ai/docs/de/go) is a $10/mo subscription providing access to curated open coding models (GLM-5, Kimi K2.5, MiMo-V2-Pro, MiniMax M2.5/M2.7). Most models use the OpenAI-compatible API; MiniMax models use the Anthropic Messages API — the gateway handles both automatically.
 
+### Moonshot AI
+
+```bash
+llm-gateway login moonshot
+```
+
+The key is stored in `~/.config/llm-gateway/moonshot-key.txt` with mode `0600`.
+You can instead set `MOONSHOT_API_KEY`. Kimi K3 is available as
+`moonshot/kimi-k3` (or any configured alias such as `kimi3`).
+
 ## Usage
 
 ```bash
@@ -140,11 +151,19 @@ Default config path: `~/.config/llm-gateway/config.json`
       "name": "my-provider",
       "api_key": "env:MY_API_KEY",
       "api_base": "https://api.example.com/v1"
+    },
+    {
+      "type": "moonshot",
+      "name": "moonshot",
+      "api_key": "env:MOONSHOT_API_KEY",
+      "api_base": "https://api.moonshot.ai/v1",
+      "models": ["kimi-k3"]
     }
   ],
   "model_aliases": {
     "claude": "anthropic/claude-sonnet-4-6",
-    "gpt": "chatgpt/gpt-5.4-mini"
+    "gpt": "chatgpt/gpt-5.4-mini",
+    "kimi3": "moonshot/kimi-k3"
   }
 }
 ```

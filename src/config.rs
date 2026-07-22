@@ -61,6 +61,8 @@ pub enum ProviderConfig {
     DeepSeek(DeepSeekProviderConfig),
     /// DeepInfra provider (OpenAI-compatible)
     DeepInfra(DeepInfraProviderConfig),
+    /// Moonshot AI provider (OpenAI-compatible Kimi models)
+    Moonshot(MoonshotProviderConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +284,52 @@ pub fn default_deepinfra_key_path() -> Option<PathBuf> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoonshotProviderConfig {
+    #[serde(default = "default_moonshot_name")]
+    pub name: String,
+
+    /// API key. Supports "env:VAR_NAME" syntax.
+    pub api_key: Option<String>,
+
+    /// Path to a file containing the API key (written by `llm-gateway login moonshot`).
+    /// Used as a fallback when `api_key` is not set. Defaults to
+    /// ~/.config/llm-gateway/moonshot-key.txt
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
+
+    #[serde(default = "default_moonshot_api_base")]
+    pub api_base: String,
+
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+impl MoonshotProviderConfig {
+    pub fn resolve_key(&self) -> Option<String> {
+        if let Some(key) = &self.api_key {
+            if !key.is_empty() {
+                return Some(key.clone());
+            }
+        }
+        let path = self
+            .api_key_file
+            .clone()
+            .or_else(default_moonshot_key_path)?;
+        let contents = std::fs::read_to_string(path).ok()?;
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+}
+
+pub fn default_moonshot_key_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("llm-gateway").join("moonshot-key.txt"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenaiCompatibleProviderConfig {
     pub name: String,
 
@@ -361,6 +409,12 @@ fn default_deepinfra_name() -> String {
 fn default_deepinfra_api_base() -> String {
     "https://api.deepinfra.com/v1/openai".to_string()
 }
+fn default_moonshot_name() -> String {
+    "moonshot".to_string()
+}
+fn default_moonshot_api_base() -> String {
+    "https://api.moonshot.ai/v1".to_string()
+}
 
 impl GatewayConfig {
     /// Load config from a JSON file path.
@@ -397,6 +451,9 @@ impl GatewayConfig {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::DeepInfra(cfg) => {
+                    cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
+                }
+                ProviderConfig::Moonshot(cfg) => {
                     cfg.api_key = cfg.api_key.as_ref().and_then(|k| resolve_env(k));
                 }
                 ProviderConfig::Chatgpt(_) => {
@@ -463,5 +520,26 @@ mod tests {
         let json = minimal_config_json(r#""virtual_models": {}"#);
         let config: GatewayConfig = serde_json::from_str(&json).expect("should parse");
         assert!(config.virtual_models.is_empty());
+    }
+
+    #[test]
+    fn moonshot_provider_parses_with_defaults() {
+        let config: GatewayConfig = serde_json::from_str(
+            r#"{
+                "providers": [{
+                    "type": "moonshot",
+                    "api_key": "env:MOONSHOT_API_KEY",
+                    "models": ["kimi-k3"]
+                }]
+            }"#,
+        )
+        .expect("should parse");
+
+        let ProviderConfig::Moonshot(provider) = &config.providers[0] else {
+            panic!("expected Moonshot provider");
+        };
+        assert_eq!(provider.name, "moonshot");
+        assert_eq!(provider.api_base, "https://api.moonshot.ai/v1");
+        assert_eq!(provider.models, ["kimi-k3"]);
     }
 }
