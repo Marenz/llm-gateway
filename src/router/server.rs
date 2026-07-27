@@ -52,35 +52,21 @@ pub struct AppState {
 /// response immediately or advance to the next failover target.
 #[derive(Debug, PartialEq)]
 pub enum FailoverDecision {
-    /// Return this response to the client immediately (success or non-retryable client error).
+    /// Return a successful response to the client immediately.
     Return,
-    /// Retry with the next target (rate-limit, server error, or transport failure).
+    /// Retry with the next target after any failed response.
     Advance,
 }
 
 /// Classify an HTTP status code for virtual-model failover purposes.
 ///
-/// - 2xx, 400, 401, 403, 422 → Return immediately (a malformed request or an
-///   auth failure won't be fixed by trying a different model on the same chain).
-/// - 402, 404, 408, 429, 5xx → Advance to the next target. These all mean "this
-///   particular target can't serve the request right now" — model not found,
-///   account out of balance/credit, request timeout, rate-limited, or upstream
-///   server error — exactly the cases a backup provider should cover.
+/// Successful responses return immediately. Every non-2xx response advances to
+/// the next target so a provider-specific error cannot prevent fallback.
 pub fn classify_failover_status(status: reqwest::StatusCode) -> FailoverDecision {
     if status.is_success() {
-        return FailoverDecision::Return;
-    }
-    match status.as_u16() {
-        // Bad-request / auth errors won't be fixed by a different target.
-        400 | 401 | 403 | 422 => FailoverDecision::Return,
-        // Provider-unusable conditions → advance to the next target:
-        //   402 = out of balance/credit, 404 = model not found,
-        //   408 = upstream timeout, 429 = rate-limited.
-        402 | 404 | 408 | 429 => FailoverDecision::Advance,
-        // Upstream server errors are retryable elsewhere.
-        s if s >= 500 => FailoverDecision::Advance,
-        // All other client errors: return as-is.
-        _ => FailoverDecision::Return,
+        FailoverDecision::Return
+    } else {
+        FailoverDecision::Advance
     }
 }
 
@@ -1985,26 +1971,26 @@ mod tests {
     }
 
     #[test]
-    fn status_400_returns_immediately() {
+    fn status_400_advances() {
         assert_eq!(
             classify_failover_status(reqwest::StatusCode::BAD_REQUEST),
-            FailoverDecision::Return
+            FailoverDecision::Advance
         );
     }
 
     #[test]
-    fn status_401_returns_immediately() {
+    fn status_401_advances() {
         assert_eq!(
             classify_failover_status(reqwest::StatusCode::UNAUTHORIZED),
-            FailoverDecision::Return
+            FailoverDecision::Advance
         );
     }
 
     #[test]
-    fn status_403_returns_immediately() {
+    fn status_403_advances() {
         assert_eq!(
             classify_failover_status(reqwest::StatusCode::FORBIDDEN),
-            FailoverDecision::Return
+            FailoverDecision::Advance
         );
     }
 
@@ -2036,10 +2022,10 @@ mod tests {
     }
 
     #[test]
-    fn status_422_returns_immediately() {
+    fn status_422_advances() {
         assert_eq!(
             classify_failover_status(reqwest::StatusCode::UNPROCESSABLE_ENTITY),
-            FailoverDecision::Return
+            FailoverDecision::Advance
         );
     }
 
@@ -2162,9 +2148,8 @@ mod tests {
     }
 
     #[test]
-    fn failover_stops_on_non_retryable_client_error() {
-        // 401 Unauthorized: not worth retrying, return immediately
-        let statuses = vec![429u16, 401, 200];
+    fn failover_advances_past_client_error() {
+        let statuses = vec![429u16, 403, 200];
         let mut tried = Vec::new();
         let mut final_returned = None;
 
@@ -2181,7 +2166,7 @@ mod tests {
             }
         }
 
-        assert_eq!(final_returned, Some(1), "should stop at 401, not continue to 200");
-        assert_eq!(tried, vec![429u16]);
+        assert_eq!(final_returned, Some(2), "should continue past 403 to 200");
+        assert_eq!(tried, vec![429u16, 403]);
     }
 }

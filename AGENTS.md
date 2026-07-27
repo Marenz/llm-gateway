@@ -156,10 +156,10 @@ target in order, advancing to the next on a retryable failure.
   `virtual_models` shadows any same-named real route.
 - Each target is resolved through `ModelResolver::resolve` (so targets may be
   prefixed names or aliases). Unresolvable targets are skipped.
-- **Failover trigger** (`classify_failover_status`): `429` and `5xx` (and
-  transport/gateway errors surfacing as 502) → advance; `2xx` and non-retryable
-  client errors (`400/401/403/404/422`) → return immediately (auth/bad-request
-  won't be fixed by retrying elsewhere).
+- **Failover trigger** (`classify_failover_status`): every non-`2xx` response
+  advances to the next target, including authentication and malformed-request
+  errors. Each new request starts from the first target, so recovered providers
+  and refreshed credentials are retried automatically.
 - All targets exhausted → returns the last failure response (502 listing tried
   targets + statuses).
 - **Streaming:** virtual-model attempts are forced to `stream:false` so the HTTP
