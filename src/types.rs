@@ -286,6 +286,9 @@ pub enum AnthropicContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<serde_json::Value>,
     },
+    Image {
+        source: AnthropicImageSource,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -303,6 +306,13 @@ pub enum AnthropicContentBlock {
         thinking: String,
         signature: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicImageSource {
+    Base64 { media_type: String, data: String },
+    Url { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

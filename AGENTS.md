@@ -128,6 +128,18 @@ curl -s http://127.0.0.1:4000/health   # {"status":"ok"}
 | Moonshot AI | API key | `moonshot` |
 | Generic | API key + custom header | `openai_compatible` |
 
+### Image inputs
+
+- `/v1/chat/completions` accepts OpenAI multipart user content with `image_url`
+  parts. ChatGPT and OpenAI-compatible providers receive those parts directly.
+- Anthropic translation preserves user images: `data:<media-type>;base64,...`
+  becomes an Anthropic `base64` image source, while other URLs become `url`
+  image sources. Images are not valid in Anthropic system or assistant content.
+- Native `/v1/messages` requests also deserialize Anthropic `image` blocks with
+  `base64` or `url` sources.
+- Provider transport support does not imply every configured model has vision;
+  test the specific model when adding it to a route or virtual-model chain.
+
 ## Virtual Models (failover chains)
 
 A **virtual model** maps a single client-facing model name to an ordered list of

@@ -28,7 +28,9 @@ pub fn translate_response(
                     },
                 });
             }
-            AnthropicContentBlock::ToolResult { .. } | AnthropicContentBlock::Thinking { .. } => {}
+            AnthropicContentBlock::Image { .. }
+            | AnthropicContentBlock::ToolResult { .. }
+            | AnthropicContentBlock::Thinking { .. } => {}
         }
     }
 

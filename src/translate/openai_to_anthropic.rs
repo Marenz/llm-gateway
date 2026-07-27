@@ -1,7 +1,8 @@
 use crate::types::{
-    AnthropicContentBlock, AnthropicMessage, AnthropicMessageContent, AnthropicNamedToolChoice,
-    AnthropicRequest, AnthropicSystem, AnthropicSystemMessage, AnthropicTool, AnthropicToolChoice,
-    AnthropicToolChoiceMode, OpenAIMessage, OpenAIMessageContent, OpenAIStop, OpenAIToolChoice,
+    AnthropicContentBlock, AnthropicImageSource, AnthropicMessage, AnthropicMessageContent,
+    AnthropicNamedToolChoice, AnthropicRequest, AnthropicSystem, AnthropicSystemMessage,
+    AnthropicTool, AnthropicToolChoice, AnthropicToolChoiceMode, OpenAIContentPart, OpenAIMessage,
+    OpenAIMessageContent, OpenAIStop, OpenAIToolChoice,
 };
 
 /// Required system prompt prefix for Anthropic OAuth tokens to unlock non-haiku models.
@@ -18,11 +19,9 @@ pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::Ant
                 &mut messages,
                 AnthropicMessage {
                     role: "user".to_string(),
-                    // Use blocks so we can attach cache_control later
-                    content: AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::Text {
-                        text: extract_text(&message.content),
-                        cache_control: None,
-                    }]),
+                    content: AnthropicMessageContent::Blocks(translate_user_content(
+                        &message.content,
+                    )),
                 },
             ),
             crate::types::OpenAIRole::Assistant => {
@@ -151,7 +150,10 @@ fn apply_cache_breakpoints(messages: &mut Vec<AnthropicMessage>) {
                             // Anthropic rejects cache_control on empty text blocks
                             // ("cache_control cannot be set for empty text blocks").
                             // Skip the breakpoint when the block text is blank.
-                            AnthropicContentBlock::Text { text, cache_control } => {
+                            AnthropicContentBlock::Text {
+                                text,
+                                cache_control,
+                            } => {
                                 if !text.trim().is_empty() {
                                     *cache_control = Some(cache_marker.clone());
                                 }
@@ -217,6 +219,43 @@ fn translate_assistant_message(message: &OpenAIMessage) -> AnthropicMessage {
             }] => AnthropicMessageContent::Text(text.clone()),
             _ => AnthropicMessageContent::Blocks(blocks),
         },
+    }
+}
+
+fn translate_user_content(content: &OpenAIMessageContent) -> Vec<AnthropicContentBlock> {
+    match content {
+        OpenAIMessageContent::Text(text) => vec![AnthropicContentBlock::Text {
+            text: text.clone(),
+            cache_control: None,
+        }],
+        OpenAIMessageContent::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                OpenAIContentPart::Text { text, .. } => AnthropicContentBlock::Text {
+                    text: text.clone(),
+                    cache_control: None,
+                },
+                OpenAIContentPart::ImageUrl { image_url } => AnthropicContentBlock::Image {
+                    source: translate_image_source(&image_url.url),
+                },
+            })
+            .collect(),
+        OpenAIMessageContent::Null => Vec::new(),
+    }
+}
+
+fn translate_image_source(url: &str) -> AnthropicImageSource {
+    if let Some(data_url) = url.strip_prefix("data:") {
+        if let Some((media_type, data)) = data_url.split_once(";base64,") {
+            return AnthropicImageSource::Base64 {
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+            };
+        }
+    }
+
+    AnthropicImageSource::Url {
+        url: url.to_string(),
     }
 }
 
@@ -314,5 +353,76 @@ fn content_into_blocks(content: AnthropicMessageContent) -> Vec<AnthropicContent
             }
         }
         AnthropicMessageContent::Blocks(blocks) => blocks,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::translate_request;
+    use crate::types::OpenAIRequest;
+
+    #[test]
+    fn translates_base64_image_parts_for_anthropic() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,aGVsbG8="}
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let translated = serde_json::to_value(translate_request(&request)).unwrap();
+
+        assert_eq!(
+            translated["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "Describe this image"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aGVsbG8="
+                    }
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn translates_remote_image_urls_for_anthropic() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.webp", "detail": "high"}
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let translated = serde_json::to_value(translate_request(&request)).unwrap();
+
+        assert_eq!(
+            translated["messages"][0]["content"][0],
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": "https://example.com/image.webp"
+                }
+            })
+        );
     }
 }
