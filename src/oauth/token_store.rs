@@ -141,12 +141,36 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
+/// A lock file older than this is treated as abandoned. The owner is only
+/// supposed to hold it for the few milliseconds of a token read/write, so any
+/// lock this old belongs to a process that died (crash, SIGKILL, `systemctl
+/// restart`) before `Drop` could clean up.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// Upper bound on how long to wait for a lock held by a *live* owner. Failing
+/// with an actionable error beats hanging forever.
+const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
+
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug)]
 struct FileLock {
     path: PathBuf,
 }
 
 impl FileLock {
     async fn acquire(path: &Path) -> anyhow::Result<Self> {
+        Self::acquire_with(path, LOCK_STALE_AFTER, LOCK_ACQUIRE_TIMEOUT).await
+    }
+
+    async fn acquire_with(
+        path: &Path,
+        stale_after: Duration,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        use tokio::io::AsyncWriteExt;
+
+        let start = std::time::Instant::now();
         loop {
             match tokio::fs::OpenOptions::new()
                 .write(true)
@@ -154,13 +178,33 @@ impl FileLock {
                 .open(path)
                 .await
             {
-                Ok(_) => {
+                Ok(mut file) => {
+                    // Record the owner so a stale lock can be attributed.
+                    let _ = file.write_all(std::process::id().to_string().as_bytes()).await;
+                    let _ = file.flush().await;
                     return Ok(Self {
                         path: path.to_path_buf(),
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if Self::reclaim_if_stale(path, stale_after).await {
+                        continue;
+                    }
+                    if start.elapsed() >= timeout {
+                        let owner = tokio::fs::read_to_string(path)
+                            .await
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| format!(" (created by pid {})", s.trim()))
+                            .unwrap_or_default();
+                        anyhow::bail!(
+                            "timed out after {:?} waiting for lock {}{owner}. \
+                             If no llm-gateway process is running, delete that file.",
+                            timeout,
+                            path.display(),
+                        );
+                    }
+                    tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
                 }
                 Err(err) => {
                     return Err(err)
@@ -169,10 +213,94 @@ impl FileLock {
             }
         }
     }
+
+    /// Delete a lock file whose owner is gone. Returns true if it was reclaimed,
+    /// so the caller can immediately retry the create.
+    async fn reclaim_if_stale(path: &Path, stale_after: Duration) -> bool {
+        let Ok(metadata) = tokio::fs::metadata(path).await else {
+            // Vanished between the failed create and now — retrying is correct.
+            return true;
+        };
+        let age = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .unwrap_or_default();
+        if age < stale_after {
+            return false;
+        }
+        tokio::fs::remove_file(path).await.is_ok()
+    }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    fn temp_lock_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("llm-gateway-{name}-{}.lock", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn acquire_creates_and_drop_removes() {
+        let path = temp_lock_path("basic");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let _lock = FileLock::acquire(&path).await.expect("should acquire");
+            assert!(path.exists(), "lock file should exist while held");
+        }
+        assert!(!path.exists(), "Drop should remove the lock file");
+    }
+
+    /// Regression: a lock left behind by a killed process used to make every
+    /// later token load/save spin at 50ms forever, hanging both `login` and
+    /// every inference request that had to read the token.
+    #[tokio::test]
+    async fn stale_lock_is_reclaimed_instead_of_hanging() {
+        let path = temp_lock_path("stale");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"").expect("write orphan lock");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let lock = tokio::time::timeout(
+            Duration::from_secs(2),
+            FileLock::acquire_with(&path, Duration::from_millis(50), Duration::from_secs(1)),
+        )
+        .await
+        .expect("must not hang on a stale lock")
+        .expect("must reclaim a stale lock");
+
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn live_lock_times_out_with_actionable_error() {
+        let path = temp_lock_path("live");
+        let _ = std::fs::remove_file(&path);
+
+        let held = FileLock::acquire(&path).await.expect("should acquire");
+
+        // stale_after is long, so the held lock is never reclaimed and we must
+        // hit the timeout rather than spin forever.
+        let err = FileLock::acquire_with(&path, Duration::from_secs(60), Duration::from_millis(150))
+            .await
+            .expect_err("must not acquire a live lock");
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "unexpected error: {msg}");
+        assert!(
+            msg.contains(&std::process::id().to_string()),
+            "error should name the lock owner: {msg}"
+        );
+
+        drop(held);
     }
 }
