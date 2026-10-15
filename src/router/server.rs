@@ -58,6 +58,9 @@ pub enum FailoverDecision {
     Advance,
 }
 
+#[derive(Clone, Copy)]
+struct CacheValidationFailure;
+
 /// Classify an HTTP status code for virtual-model failover purposes.
 ///
 /// Successful responses return immediately. Every non-2xx response advances to
@@ -68,6 +71,20 @@ pub fn classify_failover_status(status: reqwest::StatusCode) -> FailoverDecision
     } else {
         FailoverDecision::Advance
     }
+}
+
+fn classify_virtual_response(response: &Response) -> FailoverDecision {
+    if response
+        .extensions()
+        .get::<CacheValidationFailure>()
+        .is_some()
+    {
+        return FailoverDecision::Return;
+    }
+    classify_failover_status(
+        reqwest::StatusCode::from_u16(response.status().as_u16())
+            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+    )
 }
 
 pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
@@ -347,7 +364,7 @@ async fn virtual_model_dispatch(
         let response = dispatch_resolved(state, resolved, &target_req, headers, request_id).await;
         let status = response.status();
 
-        match classify_failover_status(reqwest::StatusCode::from_u16(status.as_u16()).unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR)) {
+        match classify_virtual_response(&response) {
             FailoverDecision::Return => {
                 if client_wants_stream && status.is_success() {
                     return json_completion_to_sse(response, request_id).await;
@@ -455,7 +472,10 @@ async fn dispatch_resolved(
                 return error_response(StatusCode::BAD_GATEWAY, "anthropic provider not configured");
             }
 
-            let mut upstream_request = translate_request(req);
+            let mut upstream_request = match translate_anthropic_request(req) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
             upstream_request.model = resolved.upstream_model.clone();
 
             // Try with failover across providers
@@ -504,8 +524,7 @@ async fn dispatch_resolved(
             let Some(provider) = state.openai_compat_providers.get(&resolved.provider_name) else {
                 return error_response(StatusCode::BAD_GATEWAY, "provider not configured");
             };
-            let mut upstream_request = req.clone();
-            upstream_request.model = resolved.upstream_model.clone();
+            let mut upstream_request = openai_passthrough_request(req, &resolved.upstream_model);
             // XiaoMiMo supports OpenAI-style cache_control markers on content parts
             if resolved.provider_kind == ProviderKind::XiaomiMimo {
                 apply_openai_cache_markers(&mut upstream_request.messages);
@@ -518,7 +537,10 @@ async fn dispatch_resolved(
             };
             if provider.uses_anthropic_format(&resolved.upstream_model) {
                 // Anthropic-compatible models (MiniMax)
-                let mut upstream_request = translate_request(req);
+                let mut upstream_request = match translate_anthropic_request(req) {
+                    Ok(request) => request,
+                    Err(response) => return response,
+                };
                 upstream_request.model = resolved.upstream_model.clone();
                 match provider
                     .send_anthropic_json("/v1/messages", &upstream_request)
@@ -538,8 +560,7 @@ async fn dispatch_resolved(
                 }
             } else {
                 // OpenAI-compatible models (GLM-5, Kimi, MiMo)
-                let mut upstream_request = req.clone();
-                upstream_request.model = resolved.upstream_model.clone();
+                let upstream_request = openai_passthrough_request(req, &resolved.upstream_model);
                 match provider
                     .send_openai_json("/v1/chat/completions", &upstream_request)
                     .await
@@ -564,8 +585,7 @@ async fn dispatch_resolved(
             };
             // Zen models: most use /v1/chat/completions, Claude uses /v1/messages
             // For simplicity, try chat/completions first (works for most models)
-            let mut upstream_request = req.clone();
-            upstream_request.model = resolved.upstream_model.clone();
+            let upstream_request = openai_passthrough_request(req, &resolved.upstream_model);
             match provider
                 .send_openai_json("/v1/chat/completions", &upstream_request)
                 .await
@@ -587,8 +607,7 @@ async fn dispatch_resolved(
             let Some(provider) = state.deepseek.as_ref() else {
                 return error_response(StatusCode::BAD_GATEWAY, "deepseek provider not configured");
             };
-            let mut upstream_request = req.clone();
-            upstream_request.model = resolved.upstream_model.clone();
+            let upstream_request = openai_passthrough_request(req, &resolved.upstream_model);
             match provider
                 .send_json("/chat/completions", &upstream_request)
                 .await
@@ -610,8 +629,7 @@ async fn dispatch_resolved(
             let Some(provider) = state.deepinfra.as_ref() else {
                 return error_response(StatusCode::BAD_GATEWAY, "deepinfra provider not configured");
             };
-            let mut upstream_request = req.clone();
-            upstream_request.model = resolved.upstream_model.clone();
+            let upstream_request = openai_passthrough_request(req, &resolved.upstream_model);
             match provider
                 .send_json("/chat/completions", &upstream_request)
                 .await
@@ -901,8 +919,7 @@ async fn collect_chatgpt_stream(
                             "response.completed" | "response.incomplete" => {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                                     if let Some(usage) = v.get("response").and_then(|r| r.get("usage")) {
-                                        state.input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                        state.output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        chatgpt_translate::apply_usage(&mut state, usage);
                                     }
                                 }
                                 finish_reason = if !tool_calls.is_empty() {
@@ -944,18 +961,24 @@ async fn collect_chatgpt_stream(
         message["tool_calls"] = json!(tool_calls);
     }
 
+    let mut usage = json!({
+        "prompt_tokens": state.input_tokens,
+        "completion_tokens": state.output_tokens,
+        "total_tokens": state.input_tokens + state.output_tokens,
+    });
+    if let Some(cached_tokens) = state.cached_tokens {
+        usage["cache_read_input_tokens"] = json!(cached_tokens);
+    }
+
     Json(json!({
         "id": format!("chatcmpl-{request_id}"),
         "object": "chat.completion",
         "created": created,
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {
-            "prompt_tokens": state.input_tokens,
-            "completion_tokens": state.output_tokens,
-            "total_tokens": state.input_tokens + state.output_tokens,
-        }
-    })).into_response()
+        "usage": usage
+    }))
+    .into_response()
 }
 
 async fn translate_chatgpt_sse(
@@ -1246,6 +1269,25 @@ fn apply_openai_cache_markers(messages: &mut Vec<crate::types::OpenAIMessage>) {
             }
         }
     }
+}
+
+fn openai_passthrough_request(req: &OpenAIRequest, upstream_model: &str) -> OpenAIRequest {
+    let mut upstream = req.clone();
+    upstream.model = upstream_model.to_string();
+    for message in &mut upstream.messages {
+        message.cache_control = None;
+    }
+    upstream
+}
+
+fn translate_anthropic_request(req: &OpenAIRequest) -> Result<AnthropicRequest, Response> {
+    translate_request(req).map_err(cache_validation_response)
+}
+
+fn cache_validation_response(message: String) -> Response {
+    let mut response = error_response(StatusCode::BAD_REQUEST, message);
+    response.extensions_mut().insert(CacheValidationFailure);
+    response
 }
 
 fn extract_auth_header(headers: &HeaderMap) -> Option<String> {
@@ -1952,6 +1994,124 @@ impl OpenCodeGoProvider {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn collected_chatgpt_response_preserves_cached_token_details() {
+        use axum::body::to_bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = concat!(
+            "event: response.completed\n",
+            "data: {\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":70}}}}\n\n"
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let upstream = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+
+        let response = collect_chatgpt_stream(upstream, "model".into(), "request".into()).await;
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let completion: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        server.await.unwrap();
+
+        assert_eq!(completion["usage"]["prompt_tokens"], 100);
+        assert_eq!(completion["usage"]["cache_read_input_tokens"], 70);
+        assert_eq!(completion["usage"]["total_tokens"], 120);
+        assert!(
+            completion["usage"]
+                .get("cache_creation_input_tokens")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn openai_passthrough_strips_gateway_cache_breakpoints() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "client-model",
+            "messages": [{
+                "role": "user",
+                "content": "hello",
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }))
+        .unwrap();
+
+        let upstream = openai_passthrough_request(&request, "upstream-model");
+        let serialized = serde_json::to_value(&upstream).unwrap();
+
+        assert_eq!(upstream.model, "upstream-model");
+        assert!(serialized["messages"][0].get("cache_control").is_none());
+        assert!(request.messages[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn cache_validation_failures_do_not_advance_virtual_failover() {
+        let requests = [
+            json!({
+                "model": "virtual",
+                "messages": [{
+                    "role": "user",
+                    "content": "hello",
+                    "cache_control": {"type": "persistent"}
+                }]
+            }),
+            json!({
+                "model": "virtual",
+                "messages": [{
+                    "role": "user",
+                    "content": "",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }),
+            json!({
+                "model": "virtual",
+                "messages": [
+                    {"role": "user", "content": "u1", "cache_control": {"type": "ephemeral"}},
+                    {"role": "assistant", "content": "a1", "cache_control": {"type": "ephemeral"}},
+                    {"role": "user", "content": "u2", "cache_control": {"type": "ephemeral"}},
+                    {"role": "assistant", "content": "a2", "cache_control": {"type": "ephemeral"}},
+                    {"role": "user", "content": "u3", "cache_control": {"type": "ephemeral"}}
+                ]
+            }),
+        ];
+
+        for value in requests {
+            let request: OpenAIRequest = serde_json::from_value(value).unwrap();
+            let response = translate_anthropic_request(&request).unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let mut attempted_targets = 1;
+            if classify_virtual_response(&response) == FailoverDecision::Advance {
+                attempted_targets += 1;
+            }
+            assert_eq!(attempted_targets, 1, "must not try the next target");
+        }
+    }
+
+    #[test]
+    fn ordinary_provider_errors_still_advance_virtual_failover() {
+        let response = error_response(StatusCode::BAD_REQUEST, "provider rejected request");
+
+        let mut attempted_targets = 1;
+        if classify_virtual_response(&response) == FailoverDecision::Advance {
+            attempted_targets += 1;
+        }
+        assert_eq!(attempted_targets, 2, "must try the next target");
+    }
+
     // ── classify_failover_status tests ─────────────────────────────────────
 
     #[test]
@@ -2065,9 +2225,10 @@ mod tests {
     //
     // The virtual-model dispatch loop is async and tied to AppState (which requires
     // real provider instances). Rather than spinning up an HTTP mock server, we
-    // test the pure classification helper exhaustively above, and verify the
-    // iteration logic through the status classifier: the loop advances iff
-    // classify_failover_status returns Advance, and returns iff it returns Return.
+    // test the pure classification helpers exhaustively above, and verify the
+    // iteration logic through the status classifier. The virtual-response
+    // classifier first stops on marked client-validation failures, then delegates
+    // every ordinary response to the status classifier tested below.
     //
     // This mirrors the actual loop in virtual_model_dispatch:
     //   FailoverDecision::Return  → return response immediately

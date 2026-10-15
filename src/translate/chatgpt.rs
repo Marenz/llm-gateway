@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::types::{OpenAIMessageContent, OpenAIRequest, OpenAIRole};
 
@@ -269,14 +269,26 @@ pub fn from_responses_response(resp: &Value, original_model: &str, request_id: &
         message["tool_calls"] = json!(tool_calls);
     }
 
-    let (input_tokens, output_tokens) = if let Some(u) = usage {
+    let (input_tokens, output_tokens, cached_tokens) = if let Some(u) = usage {
         (
             u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
             u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            u.get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64),
         )
     } else {
-        (0, 0)
+        (0, 0, None)
     };
+
+    let mut usage = json!({
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    });
+    if let Some(cached_tokens) = cached_tokens {
+        usage["cache_read_input_tokens"] = json!(cached_tokens);
+    }
 
     json!({
         "id": format!("chatcmpl-{request_id}"),
@@ -288,11 +300,7 @@ pub fn from_responses_response(resp: &Value, original_model: &str, request_id: &
             "message": message,
             "finish_reason": finish_reason,
         }],
-        "usage": {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        }
+        "usage": usage
     })
 }
 
@@ -303,6 +311,7 @@ pub struct ChatgptStreamState {
     pub sent_role: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: Option<u64>,
     /// call_id -> (index, name)
     pub tool_calls: HashMap<String, (usize, String)>,
     pub tool_call_count: usize,
@@ -399,14 +408,7 @@ pub fn translate_stream_event(
 
         "response.completed" | "response.incomplete" => {
             if let Some(usage) = data.get("response").and_then(|r| r.get("usage")) {
-                state.input_tokens = usage
-                    .get("input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                state.output_tokens = usage
-                    .get("output_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                apply_usage(state, usage);
             }
             let finish_reason = if !state.tool_calls.is_empty() {
                 "tool_calls"
@@ -415,6 +417,14 @@ pub fn translate_stream_event(
             } else {
                 "stop"
             };
+            let mut usage = json!({
+                "prompt_tokens": state.input_tokens,
+                "completion_tokens": state.output_tokens,
+                "total_tokens": state.input_tokens + state.output_tokens,
+            });
+            if let Some(cached_tokens) = state.cached_tokens {
+                usage["cache_read_input_tokens"] = json!(cached_tokens);
+            }
             vec![
                 sse(json!({
                     "id": format!("chatcmpl-{message_id}"),
@@ -422,11 +432,7 @@ pub fn translate_stream_event(
                     "created": now_unix(),
                     "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                    "usage": {
-                        "prompt_tokens": state.input_tokens,
-                        "completion_tokens": state.output_tokens,
-                        "total_tokens": state.input_tokens + state.output_tokens,
-                    }
+                    "usage": usage
                 })),
                 "data: [DONE]\n\n".to_string(),
             ]
@@ -444,6 +450,21 @@ pub fn translate_stream_event(
 
         _ => vec![],
     }
+}
+
+pub fn apply_usage(state: &mut ChatgptStreamState, usage: &Value) {
+    state.input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    state.output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    state.cached_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
 }
 
 fn maybe_role_chunk(
@@ -474,4 +495,78 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{ChatgptStreamState, from_responses_response, translate_stream_event};
+
+    #[test]
+    fn collected_response_shape_reports_cached_subset_without_double_counting() {
+        let response = json!({
+            "output": [],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 70}
+            }
+        });
+
+        let completion = from_responses_response(&response, "model", "id");
+
+        assert_eq!(completion["usage"]["prompt_tokens"], 100);
+        assert_eq!(completion["usage"]["cache_read_input_tokens"], 70);
+        assert_eq!(completion["usage"]["total_tokens"], 120);
+    }
+
+    #[test]
+    fn streaming_chatgpt_usage_reports_cached_subset_without_double_counting() {
+        let mut state = ChatgptStreamState::default();
+        let event = json!({
+            "response": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "input_tokens_details": {"cached_tokens": 70}
+                }
+            }
+        });
+
+        let chunks = translate_stream_event(
+            "response.completed",
+            &event.to_string(),
+            "model",
+            "id",
+            &mut state,
+        );
+        let chunk: Value =
+            serde_json::from_str(chunks[0].trim_start_matches("data: ").trim()).unwrap();
+
+        assert_eq!(chunk["usage"]["prompt_tokens"], 100);
+        assert_eq!(chunk["usage"]["cache_read_input_tokens"], 70);
+        assert_eq!(chunk["usage"]["total_tokens"], 120);
+        assert!(chunk["usage"].get("cache_creation_input_tokens").is_none());
+    }
+
+    #[test]
+    fn missing_chatgpt_cache_details_remain_absent() {
+        let mut state = ChatgptStreamState::default();
+        let event = json!({
+            "response": {"usage": {"input_tokens": 100, "output_tokens": 20}}
+        });
+
+        let chunks = translate_stream_event(
+            "response.completed",
+            &event.to_string(),
+            "model",
+            "id",
+            &mut state,
+        );
+        let chunk: Value =
+            serde_json::from_str(chunks[0].trim_start_matches("data: ").trim()).unwrap();
+
+        assert!(chunk["usage"].get("cache_read_input_tokens").is_none());
+    }
 }

@@ -140,6 +140,21 @@ curl -s http://127.0.0.1:4000/health   # {"status":"ok"}
 - Provider transport support does not imply every configured model has vision;
   test the specific model when adding it to a route or virtual-model chain.
 
+### Prompt cache passthrough
+
+- OpenAI-shaped `message.cache_control` is an explicit Anthropic cache boundary.
+  Explicit boundaries replace the legacy last-three-message heuristic and are
+  applied only after adjacent same-role messages have been merged.
+- Anthropic permits at most four breakpoints. Empty text and thinking blocks are
+  not cacheable; text, image, tool-use, and tool-result blocks are cacheable.
+- Cache-validation 400s are client errors and must stop virtual-model failover;
+  ordinary upstream provider errors retain the normal failover policy.
+- Anthropic `input_tokens` excludes cache-read and cache-creation tokens, so they
+  are separate additive input counters. Keep OpenAI-shaped `total_tokens` equal
+  to `prompt_tokens + completion_tokens`; clients account for Anthropic cache
+  fields separately. ChatGPT `input_tokens_details.cached_tokens` is already
+  included in `input_tokens`; expose it without adding it to prompt or total.
+
 ## Virtual Models (failover chains)
 
 A **virtual model** maps a single client-facing model name to an ordered list of

@@ -48,6 +48,8 @@ pub struct OpenAIMessage {
     pub tool_calls: Option<Vec<OpenAIToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -154,6 +156,10 @@ pub struct OpenAIUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,12 +294,16 @@ pub enum AnthropicContentBlock {
     },
     Image {
         source: AnthropicImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -479,4 +489,30 @@ pub enum AuthMethod {
     ApiKey(String),
     ApiKeyHeader { header_name: String, key: String },
     None,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{OpenAIMessage, OpenAIUsage};
+
+    #[test]
+    fn legacy_openai_shapes_deserialize_without_cache_fields() {
+        let message: OpenAIMessage = serde_json::from_value(json!({
+            "role": "user",
+            "content": "hello"
+        }))
+        .unwrap();
+        let usage: OpenAIUsage = serde_json::from_value(json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+        }))
+        .unwrap();
+
+        assert!(message.cache_control.is_none());
+        assert!(usage.cache_creation_input_tokens.is_none());
+        assert!(usage.cache_read_input_tokens.is_none());
+    }
 }

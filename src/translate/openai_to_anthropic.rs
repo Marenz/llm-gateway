@@ -8,28 +8,50 @@ use crate::types::{
 /// Required system prompt prefix for Anthropic OAuth tokens to unlock non-haiku models.
 const OAUTH_REQUIRED_SYSTEM: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::AnthropicRequest {
-    let system = collect_system_prompt(&req.messages);
+pub fn translate_request(
+    req: &crate::types::OpenAIRequest,
+) -> Result<crate::types::AnthropicRequest, String> {
+    let cache_controls = req
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            message
+                .cache_control
+                .as_ref()
+                .map(|marker| validate_cache_control(marker, index))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let explicit_breakpoints = cache_controls.iter().any(Option::is_some);
+    let (system, mut placed_breakpoints) =
+        collect_system_prompt(&req.messages, &cache_controls, explicit_breakpoints)?;
     let mut messages = Vec::new();
+    let mut message_breakpoints: Vec<Option<(usize, serde_json::Value)>> = Vec::new();
 
-    for message in &req.messages {
+    for (source_index, message) in req.messages.iter().enumerate() {
+        let cache_control = cache_controls[source_index].clone();
         match message.role {
             crate::types::OpenAIRole::System => {}
-            crate::types::OpenAIRole::User => push_message(
-                &mut messages,
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: AnthropicMessageContent::Blocks(translate_user_content(
-                        &message.content,
-                    )),
-                },
-            ),
+            crate::types::OpenAIRole::User => {
+                let index = push_message(
+                    &mut messages,
+                    AnthropicMessage {
+                        role: "user".to_string(),
+                        content: AnthropicMessageContent::Blocks(translate_user_content(
+                            &message.content,
+                        )),
+                    },
+                );
+                remember_breakpoint(&mut message_breakpoints, index, source_index, cache_control)?;
+            }
             crate::types::OpenAIRole::Assistant => {
-                push_message(&mut messages, translate_assistant_message(message));
+                let index = push_message(&mut messages, translate_assistant_message(message));
+                remember_breakpoint(&mut message_breakpoints, index, source_index, cache_control)?;
             }
             crate::types::OpenAIRole::Tool => {
                 if let Some(tool_call_id) = &message.tool_call_id {
-                    push_message(
+                    let index = push_message(
                         &mut messages,
                         AnthropicMessage {
                             role: "user".to_string(),
@@ -44,14 +66,47 @@ pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::Ant
                             ]),
                         },
                     );
+                    remember_breakpoint(
+                        &mut message_breakpoints,
+                        index,
+                        source_index,
+                        cache_control,
+                    )?;
+                } else if cache_control.is_some() {
+                    return Err(format!(
+                        "messages[{source_index}].cache_control cannot be represented: tool message has no tool_call_id"
+                    ));
                 }
             }
         }
     }
 
-    // Apply cache_control breakpoints. Anthropic allows max 4 total.
-    // Use 1 on the last system block, 3 on the last 3 message turns.
-    apply_cache_breakpoints(&mut messages);
+    if explicit_breakpoints {
+        for (message_index, breakpoint) in message_breakpoints.into_iter().enumerate() {
+            if let Some((source_index, marker)) = breakpoint {
+                let message = messages.get_mut(message_index).ok_or_else(|| {
+                    format!(
+                        "messages[{source_index}].cache_control could not be mapped after role merging"
+                    )
+                })?;
+                set_final_block_cache_control(message, marker).map_err(|reason| {
+                    format!(
+                        "messages[{source_index}].cache_control cannot be represented: {reason}"
+                    )
+                })?;
+                placed_breakpoints += 1;
+            }
+        }
+        if placed_breakpoints > 4 {
+            return Err(format!(
+                "Anthropic supports at most 4 cache breakpoints, but this request produces {placed_breakpoints} after role merging"
+            ));
+        }
+    } else {
+        // Preserve the legacy bounded heuristic when the client did not choose
+        // explicit boundaries: one system marker and up to three message turns.
+        apply_cache_breakpoints(&mut messages);
+    }
 
     let mut tools = req.tools.as_ref().map(|tools| {
         tools
@@ -87,7 +142,7 @@ pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::Ant
         None => None,
     };
 
-    AnthropicRequest {
+    Ok(AnthropicRequest {
         model: req.model.clone(),
         max_tokens: req.max_tokens.unwrap_or(4096),
         messages,
@@ -101,10 +156,14 @@ pub fn translate_request(req: &crate::types::OpenAIRequest) -> crate::types::Ant
         stop_sequences: translate_stop(req.stop.as_ref()),
         metadata: None,
         thinking: translate_thinking(req.reasoning_effort.as_deref()),
-    }
+    })
 }
 
-fn collect_system_prompt(messages: &[OpenAIMessage]) -> Option<AnthropicSystem> {
+fn collect_system_prompt(
+    messages: &[OpenAIMessage],
+    cache_controls: &[Option<serde_json::Value>],
+    explicit_breakpoints: bool,
+) -> Result<(Option<AnthropicSystem>, usize), String> {
     // Always prepend the required OAuth system prompt so non-haiku models work.
     let mut blocks = vec![AnthropicSystemMessage {
         kind: "text".to_string(),
@@ -112,26 +171,124 @@ fn collect_system_prompt(messages: &[OpenAIMessage]) -> Option<AnthropicSystem> 
         cache_control: None,
     }];
 
-    for message in messages
+    let mut placed_breakpoints = 0;
+    for (index, message) in messages
         .iter()
-        .filter(|m| matches!(m.role, crate::types::OpenAIRole::System))
+        .enumerate()
+        .filter(|(_, message)| matches!(message.role, crate::types::OpenAIRole::System))
     {
         let text = extract_text(&message.content);
-        if !text.is_empty() {
+        let cache_control = cache_controls[index].clone();
+        if !text.trim().is_empty() {
+            placed_breakpoints += usize::from(cache_control.is_some());
             blocks.push(AnthropicSystemMessage {
                 kind: "text".to_string(),
                 text,
-                cache_control: None,
+                cache_control,
             });
+        } else if cache_control.is_some() {
+            return Err(format!(
+                "messages[{index}].cache_control cannot be represented: system message has no non-empty text"
+            ));
         }
     }
 
-    // Mark the last system block as a cache breakpoint (uses 1 of 4 allowed)
-    if let Some(last) = blocks.last_mut() {
-        last.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+    if !explicit_breakpoints {
+        // The required OAuth prefix guarantees a non-empty final system block.
+        if let Some(last) = blocks.last_mut() {
+            last.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+        }
     }
 
-    Some(AnthropicSystem::Messages(blocks))
+    Ok((Some(AnthropicSystem::Messages(blocks)), placed_breakpoints))
+}
+
+fn validate_cache_control(
+    marker: &serde_json::Value,
+    message_index: usize,
+) -> Result<serde_json::Value, String> {
+    let Some(object) = marker.as_object() else {
+        return Err(format!(
+            "messages[{message_index}].cache_control must be an object"
+        ));
+    };
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("ephemeral") {
+        return Err(format!(
+            "messages[{message_index}].cache_control.type must be \"ephemeral\""
+        ));
+    }
+    if object.keys().any(|key| key != "type" && key != "ttl") {
+        return Err(format!(
+            "messages[{message_index}].cache_control supports only type and ttl"
+        ));
+    }
+    if let Some(ttl) = object.get("ttl") {
+        if !matches!(ttl.as_str(), Some("5m" | "1h")) {
+            return Err(format!(
+                "messages[{message_index}].cache_control.ttl must be \"5m\" or \"1h\""
+            ));
+        }
+    }
+    Ok(marker.clone())
+}
+
+fn remember_breakpoint(
+    breakpoints: &mut Vec<Option<(usize, serde_json::Value)>>,
+    message_index: usize,
+    source_index: usize,
+    marker: Option<serde_json::Value>,
+) -> Result<(), String> {
+    if breakpoints.len() <= message_index {
+        breakpoints.resize(message_index + 1, None);
+    }
+    if let Some(marker) = marker {
+        if let Some((previous_source, _)) = &breakpoints[message_index] {
+            return Err(format!(
+                "messages[{previous_source}] and messages[{source_index}] request distinct cache boundaries that collapse into one Anthropic message after same-role merging"
+            ));
+        }
+        breakpoints[message_index] = Some((source_index, marker));
+    }
+    Ok(())
+}
+
+fn set_final_block_cache_control(
+    message: &mut AnthropicMessage,
+    marker: serde_json::Value,
+) -> Result<(), &'static str> {
+    match &mut message.content {
+        AnthropicMessageContent::Text(text) => {
+            if text.trim().is_empty() {
+                return Err("final text block is empty");
+            }
+            let text = std::mem::take(text);
+            message.content = AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::Text {
+                text,
+                cache_control: Some(marker),
+            }]);
+            Ok(())
+        }
+        AnthropicMessageContent::Blocks(blocks) => match blocks.last_mut() {
+            Some(AnthropicContentBlock::Text {
+                text,
+                cache_control,
+            }) if !text.trim().is_empty() => {
+                *cache_control = Some(marker);
+                Ok(())
+            }
+            Some(AnthropicContentBlock::Image { cache_control, .. })
+            | Some(AnthropicContentBlock::ToolUse { cache_control, .. })
+            | Some(AnthropicContentBlock::ToolResult { cache_control, .. }) => {
+                *cache_control = Some(marker);
+                Ok(())
+            }
+            Some(AnthropicContentBlock::Text { .. }) => Err("final text block is empty"),
+            Some(AnthropicContentBlock::Thinking { .. }) => {
+                Err("final thinking block is not cacheable")
+            }
+            None => Err("message has no content blocks"),
+        },
+    }
 }
 
 /// Apply cache_control breakpoints to the last 3 messages (using up remaining 3 of 4 allowed).
@@ -158,7 +315,9 @@ fn apply_cache_breakpoints(messages: &mut Vec<AnthropicMessage>) {
                                     *cache_control = Some(cache_marker.clone());
                                 }
                             }
-                            AnthropicContentBlock::ToolResult { cache_control, .. } => {
+                            AnthropicContentBlock::Image { cache_control, .. }
+                            | AnthropicContentBlock::ToolUse { cache_control, .. }
+                            | AnthropicContentBlock::ToolResult { cache_control, .. } => {
                                 *cache_control = Some(cache_marker.clone());
                             }
                             _ => {}
@@ -205,6 +364,7 @@ fn translate_assistant_message(message: &OpenAIMessage) -> AnthropicMessage {
                 id: tool_call.id.clone(),
                 name: tool_call.function.name.clone(),
                 input,
+                cache_control: None,
             });
         }
     }
@@ -213,10 +373,12 @@ fn translate_assistant_message(message: &OpenAIMessage) -> AnthropicMessage {
         role: "assistant".to_string(),
         content: match blocks.as_slice() {
             [] => AnthropicMessageContent::Text(String::new()),
-            [AnthropicContentBlock::Text {
-                text,
-                cache_control: None,
-            }] => AnthropicMessageContent::Text(text.clone()),
+            [
+                AnthropicContentBlock::Text {
+                    text,
+                    cache_control: None,
+                },
+            ] => AnthropicMessageContent::Text(text.clone()),
             _ => AnthropicMessageContent::Blocks(blocks),
         },
     }
@@ -237,6 +399,7 @@ fn translate_user_content(content: &OpenAIMessageContent) -> Vec<AnthropicConten
                 },
                 OpenAIContentPart::ImageUrl { image_url } => AnthropicContentBlock::Image {
                     source: translate_image_source(&image_url.url),
+                    cache_control: None,
                 },
             })
             .collect(),
@@ -298,7 +461,7 @@ fn translate_thinking(reasoning_effort: Option<&str>) -> Option<serde_json::Valu
     })
 }
 
-fn push_message(messages: &mut Vec<AnthropicMessage>, message: AnthropicMessage) {
+fn push_message(messages: &mut Vec<AnthropicMessage>, message: AnthropicMessage) -> usize {
     if let Some(last) = messages.last_mut() {
         if same_role(&last.role, &message.role) {
             last.content = merge_content(
@@ -308,11 +471,12 @@ fn push_message(messages: &mut Vec<AnthropicMessage>, message: AnthropicMessage)
                 ),
                 message.content,
             );
-            return;
+            return messages.len() - 1;
         }
     }
 
     messages.push(message);
+    messages.len() - 1
 }
 
 fn same_role(left: &str, right: &str) -> bool {
@@ -380,7 +544,7 @@ mod tests {
         }))
         .unwrap();
 
-        let translated = serde_json::to_value(translate_request(&request)).unwrap();
+        let translated = serde_json::to_value(translate_request(&request).unwrap()).unwrap();
 
         assert_eq!(
             translated["messages"][0]["content"],
@@ -392,7 +556,8 @@ mod tests {
                         "type": "base64",
                         "media_type": "image/png",
                         "data": "aGVsbG8="
-                    }
+                    },
+                    "cache_control": {"type": "ephemeral"}
                 }
             ])
         );
@@ -412,7 +577,7 @@ mod tests {
         }))
         .unwrap();
 
-        let translated = serde_json::to_value(translate_request(&request)).unwrap();
+        let translated = serde_json::to_value(translate_request(&request).unwrap()).unwrap();
 
         assert_eq!(
             translated["messages"][0]["content"][0],
@@ -421,8 +586,192 @@ mod tests {
                 "source": {
                     "type": "url",
                     "url": "https://example.com/image.webp"
-                }
+                },
+                "cache_control": {"type": "ephemeral"}
             })
         );
+    }
+
+    #[test]
+    fn explicit_breakpoints_replace_heuristic_and_follow_role_merging() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "stable prefix",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {"role": "system", "content": "volatile tail"},
+                {
+                    "role": "user",
+                    "content": "first adjacent user block",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                },
+                {"role": "user", "content": "second adjacent user block"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }],
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+        }))
+        .unwrap();
+
+        let translated = serde_json::to_value(translate_request(&request).unwrap()).unwrap();
+
+        assert_eq!(
+            translated["system"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(translated["system"][0].get("cache_control").is_none());
+        assert!(translated["system"][2].get("cache_control").is_none());
+        assert!(
+            translated["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            translated["messages"][0]["content"][1]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(
+            translated["messages"][1]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn explicit_image_boundary_preserves_multipart_content() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                ],
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }))
+        .unwrap();
+
+        let translated = serde_json::to_value(translate_request(&request).unwrap()).unwrap();
+        let blocks = translated["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn absent_explicit_breakpoints_keeps_bounded_heuristic() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+                {"role": "user", "content": "three"},
+                {"role": "assistant", "content": "four"}
+            ]
+        }))
+        .unwrap();
+
+        let translated = serde_json::to_value(translate_request(&request).unwrap()).unwrap();
+
+        assert_eq!(
+            translated["system"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(
+            translated["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        for index in 1..=3 {
+            assert_eq!(
+                translated["messages"][index]["content"][0]["cache_control"],
+                json!({"type": "ephemeral"})
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_boundary_is_rejected_without_heuristic_fallback() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "   ",
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }))
+        .unwrap();
+
+        let error = translate_request(&request).unwrap_err();
+
+        assert!(error.contains("messages[0].cache_control cannot be represented"));
+        assert!(error.contains("empty"));
+    }
+
+    #[test]
+    fn more_than_four_explicit_breakpoints_is_rejected() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "system", "content": "s", "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "u1", "cache_control": {"type": "ephemeral"}},
+                {"role": "assistant", "content": "a1", "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "u2", "cache_control": {"type": "ephemeral"}},
+                {"role": "assistant", "content": "a2", "cache_control": {"type": "ephemeral"}}
+            ]
+        }))
+        .unwrap();
+
+        let error = translate_request(&request).unwrap_err();
+
+        assert!(error.contains("at most 4 cache breakpoints"));
+        assert!(error.contains("produces 5"));
+    }
+
+    #[test]
+    fn multiple_boundaries_collapsed_by_role_merging_are_rejected() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "one", "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "two", "cache_control": {"type": "ephemeral"}}
+            ]
+        }))
+        .unwrap();
+
+        let error = translate_request(&request).unwrap_err();
+
+        assert!(error.contains("distinct cache boundaries"));
+        assert!(error.contains("same-role merging"));
+    }
+
+    #[test]
+    fn malformed_cache_control_is_rejected() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "hello",
+                "cache_control": {"type": "persistent"}
+            }]
+        }))
+        .unwrap();
+
+        let error = translate_request(&request).unwrap_err();
+
+        assert!(error.contains("cache_control.type must be \"ephemeral\""));
     }
 }

@@ -17,7 +17,9 @@ pub fn translate_response(
     for block in &resp.content {
         match block {
             AnthropicContentBlock::Text { text, .. } => text_parts.push(text.clone()),
-            AnthropicContentBlock::ToolUse { id, name, input } => {
+            AnthropicContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 tool_calls.push(OpenAIToolCall {
                     id: id.clone(),
                     kind: "function".to_string(),
@@ -47,13 +49,19 @@ pub fn translate_response(
                 name: None,
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                 tool_call_id: None,
+                cache_control: None,
             },
             finish_reason: Some(map_stop_reason(resp.stop_reason.as_deref())),
         }],
         usage: Some(OpenAIUsage {
             prompt_tokens: resp.usage.input_tokens,
             completion_tokens: resp.usage.output_tokens,
-            total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
+            total_tokens: resp
+                .usage
+                .input_tokens
+                .saturating_add(resp.usage.output_tokens),
+            cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: resp.usage.cache_read_input_tokens,
         }),
     }
 }
@@ -82,4 +90,88 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::translate_response;
+    use crate::types::AnthropicResponse;
+
+    #[test]
+    fn preserves_anthropic_cache_usage_as_additive_input() {
+        let response: AnthropicResponse = serde_json::from_value(json!({
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "claude-opus-4-6",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 30,
+                "cache_read_input_tokens": 40
+            }
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_response(&response, "model", "req")).unwrap();
+
+        assert_eq!(translated["usage"]["prompt_tokens"], 10);
+        assert_eq!(translated["usage"]["completion_tokens"], 5);
+        assert_eq!(translated["usage"]["cache_creation_input_tokens"], 30);
+        assert_eq!(translated["usage"]["cache_read_input_tokens"], 40);
+        assert_eq!(translated["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn absent_anthropic_cache_usage_remains_absent() {
+        let response: AnthropicResponse = serde_json::from_value(json!({
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "claude-opus-4-6",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_response(&response, "model", "req")).unwrap();
+
+        assert!(
+            translated["usage"]
+                .get("cache_creation_input_tokens")
+                .is_none()
+        );
+        assert!(translated["usage"].get("cache_read_input_tokens").is_none());
+        assert_eq!(translated["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn measured_zero_anthropic_cache_usage_is_not_omitted() {
+        let response: AnthropicResponse = serde_json::from_value(json!({
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "claude-opus-4-6",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            }
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_response(&response, "model", "req")).unwrap();
+
+        assert_eq!(translated["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(translated["usage"]["cache_read_input_tokens"], 0);
+    }
 }
