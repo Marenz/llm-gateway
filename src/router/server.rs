@@ -9,10 +9,9 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response, Sse};
 use axum::routing::{get, post};
 use axum::{Router, serve};
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use serde::Serialize;
 use serde_json::json;
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -27,9 +26,12 @@ use crate::providers::deepinfra::DeepInfraProvider;
 use crate::providers::zen::ZenProvider;
 use crate::router::model_resolver::ModelResolver;
 use crate::translate::anthropic_to_openai::{translate_error, translate_response};
-use crate::translate::chatgpt::{self as chatgpt_translate, ChatgptStreamState};
+use crate::translate::chatgpt as chatgpt_translate;
 use crate::translate::openai_to_anthropic::translate_request;
-use crate::translate::stream::{StreamState, translate_stream_event};
+use crate::translate::{
+    sse,
+    transport::{self, ProviderStream},
+};
 use crate::types::{
     AnthropicErrorResponse, AnthropicRequest, AnthropicResponse, OpenAIRequest, ProviderKind,
 };
@@ -305,18 +307,8 @@ async fn chat_completions(
 /// Dispatch a request for a virtual model, iterating over the target list and
 /// failing over on retryable errors (429 / 5xx / transport failure).
 ///
-/// **Streaming note:** For streaming virtual-model requests we force non-streaming
-/// upstream calls so we can inspect the HTTP status before committing to a
-/// streaming response body. If all targets succeed with 2xx we return the last
-/// non-streaming response (the client receives a normal JSON completion instead
-/// of an SSE stream). This trades streaming for correctness in failover scenarios;
-/// a single-target virtual model used purely for model aliasing will still stream
-/// correctly because the first attempt will succeed and streaming is enabled below
-/// only when there is exactly one remaining candidate that returned 2xx.
-///
-/// Concretely: we attempt each target with `stream: false`. On the first 2xx we
-/// return that JSON response. The client (e.g. opencode) handles non-streamed
-/// responses just fine.
+/// Attempts are buffered for failover; a streaming client receives the selected
+/// completion re-emitted as SSE, retaining tools, usage and terminal reason.
 async fn virtual_model_dispatch(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -394,12 +386,8 @@ async fn virtual_model_dispatch(
     })
 }
 
-/// Convert a non-streamed OpenAI chat-completion `Response` into a minimal SSE
-/// stream (one content delta chunk + `[DONE]`). Used when a virtual model was
-/// dispatched non-streaming (for failover) but the client requested streaming,
-/// so SSE-only clients still receive the completion.
-async fn json_completion_to_sse(response: Response, request_id: &str) -> Response {
-    let status = response.status();
+/// Convert a buffered completion to SSE without losing tool or terminal fields.
+async fn json_completion_to_sse(response: Response, _request_id: &str) -> Response {
     let body_bytes = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
@@ -413,45 +401,13 @@ async fn json_completion_to_sse(response: Response, request_id: &str) -> Respons
     let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(_) => {
-            // Not JSON we understand — fall back to returning it verbatim.
-            return build_response(status, vec![(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))], Body::from(body_bytes));
+            return error_response(StatusCode::BAD_GATEWAY, "invalid virtual-model completion JSON");
         }
     };
-
-    let content = parsed
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    let model = parsed.get("model").and_then(|m| m.as_str()).unwrap_or("");
-    let id = parsed
-        .get("id")
-        .and_then(|i| i.as_str())
-        .unwrap_or(request_id);
-    let created = parsed.get("created").and_then(|c| c.as_i64()).unwrap_or(0);
-
-    // First chunk: role+content delta. Second: finish. Then [DONE].
-    let chunk = serde_json::json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": serde_json::Value::Null}],
-    });
-    let finish = serde_json::json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    });
-    let sse = format!(
-        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-        chunk, finish
-    );
-    build_response(reqwest::StatusCode::OK, sse_headers(), Body::from(sse))
+    match sse::completion_to_sse(&parsed) {
+        Ok(body) => build_response(StatusCode::OK, sse_headers(), Body::from(body)),
+        Err(error) => error_response(StatusCode::BAD_GATEWAY, error),
+    }
 }
 
 /// Dispatch a single already-resolved model request to its provider.
@@ -804,7 +760,10 @@ async fn handle_anthropic_json_response(
                     body.stop_reason.as_deref().unwrap_or("unknown"),
                     content,
                 );
-                Json(translate_response(&body, &original_req.model, request_id)).into_response()
+                match translate_response(&body, &original_req.model, request_id) {
+                    Ok(completion) => Json(completion).into_response(),
+                    Err(error) => error_response(StatusCode::BAD_GATEWAY, error),
+                }
             }
             Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
         },
@@ -846,139 +805,10 @@ async fn collect_chatgpt_stream(
     model: String,
     request_id: String,
 ) -> Response {
-    use futures::StreamExt;
-
-    let mut upstream = response.bytes_stream();
-    // Accumulate raw bytes per line and decode as UTF-8 at line end. Decoding
-    // byte-by-byte via `byte as char` would Latin-1-mangle any multi-byte UTF-8
-    // (e.g. an emoji f0 9f 91 8b became four separate code points -> mojibake).
-    let mut line_buf: Vec<u8> = Vec::new();
-    let mut event_type = String::new();
-    let mut data_lines: Vec<String> = Vec::new();
-    let mut state = ChatgptStreamState::default();
-
-    // Collect all text content and tool calls
-    let mut text = String::new();
-    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-    let mut finish_reason = "stop".to_string();
-
-    while let Some(chunk) = upstream.next().await {
-        let Ok(chunk) = chunk else { break };
-        for byte in chunk {
-            if byte == b'\n' {
-                let line_bytes = std::mem::take(&mut line_buf);
-                let line = String::from_utf8_lossy(&line_bytes);
-                let line = line.trim_end_matches('\r');
-                if line.is_empty() {
-                    if !data_lines.is_empty() {
-                        let data = data_lines.join("\n");
-                        data_lines.clear();
-                        let et = std::mem::take(&mut event_type);
-                        // Process event directly
-                        match et.as_str() {
-                            "response.output_text.delta" => {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                                    if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
-                                        text.push_str(delta);
-                                    }
-                                }
-                            }
-                            "response.output_item.added" => {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                                    if let Some(item) = v.get("item") {
-                                        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default();
-                                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-                                            let idx = state.tool_call_count;
-                                            state.tool_call_count += 1;
-                                            state.tool_calls.insert(call_id.to_string(), (idx, name.to_string()));
-                                            tool_calls.push(json!({
-                                                "id": call_id,
-                                                "type": "function",
-                                                "function": {"name": name, "arguments": ""}
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                            "response.function_call_arguments.delta" => {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                                    let delta = v.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                                    let item_id = v.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-                                    if let Some((idx, _)) = state.tool_calls.get(item_id) {
-                                        if let Some(tc) = tool_calls.get_mut(*idx) {
-                                            if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                let mut new_args = args.to_string();
-                                                new_args.push_str(delta);
-                                                tc["function"]["arguments"] = json!(new_args);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            "response.completed" | "response.incomplete" => {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                                    if let Some(usage) = v.get("response").and_then(|r| r.get("usage")) {
-                                        chatgpt_translate::apply_usage(&mut state, usage);
-                                    }
-                                }
-                                finish_reason = if !tool_calls.is_empty() {
-                                    "tool_calls".to_string()
-                                } else if et == "response.incomplete" {
-                                    "length".to_string()
-                                } else {
-                                    "stop".to_string()
-                                };
-                            }
-                            _ => {}
-                        }
-                    }
-                } else if let Some(val) = line.strip_prefix("event:") {
-                    event_type = val.trim().to_string();
-                } else if let Some(val) = line.strip_prefix("data:") {
-                    data_lines.push(val.trim_start().to_string());
-                }
-            } else {
-                line_buf.push(byte);
-            }
-        }
+    match transport::collect_chatgpt(response, &model, &request_id).await {
+        Ok(completion) => Json(completion).into_response(),
+        Err(error) => error_response(StatusCode::BAD_GATEWAY, error),
     }
-
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    tracing::debug!(
-        "← done model={} tokens={}/{} finish={} content={:?}",
-        model,
-        state.input_tokens,
-        state.output_tokens,
-        finish_reason,
-        text.clone(),
-    );
-
-    let mut message = json!({ "role": "assistant", "content": text });
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = json!(tool_calls);
-    }
-
-    let mut usage = json!({
-        "prompt_tokens": state.input_tokens,
-        "completion_tokens": state.output_tokens,
-        "total_tokens": state.input_tokens + state.output_tokens,
-    });
-    if let Some(cached_tokens) = state.cached_tokens {
-        usage["cache_read_input_tokens"] = json!(cached_tokens);
-    }
-
-    Json(json!({
-        "id": format!("chatcmpl-{request_id}"),
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": usage
-    }))
-    .into_response()
 }
 
 async fn translate_chatgpt_sse(
@@ -991,19 +821,9 @@ async fn translate_chatgpt_sse(
         return proxy_json_response(response).await;
     }
 
-    let stream = stream_responses_sse(response, move |event_type, event_data, state| {
-        let chunks = chatgpt_translate::translate_stream_event(event_type, event_data, &model, &request_id, state);
-        if chunks.iter().any(|c| c.contains("[DONE]")) {
-            tracing::debug!(
-                "← done (stream) model={} tokens={}/{} content={:?}",
-                model,
-                state.input_tokens,
-                state.output_tokens,
-                state.accumulated_text.clone(),
-            );
-        }
-        chunks
-    });
+    let stream = transport::translated_stream(
+        response, model, request_id, ProviderStream::Chatgpt(Default::default()),
+    );
     build_response(status, sse_headers(), Body::from_stream(stream))
 }
 
@@ -1017,84 +837,10 @@ async fn translate_anthropic_sse(
         return proxy_json_response(response).await;
     }
 
-    let stream = stream_response_body(response, move |event_data, state| {
-        let chunks = translate_stream_event(event_data, &model, &request_id, state);
-        // Log accumulated content when stream completes
-        if chunks.iter().any(|c| c.contains("[DONE]")) {
-            tracing::debug!(
-                "← done (stream) model={} tokens={}/{} content={:?}",
-                model,
-                state.input_tokens,
-                state.output_tokens,
-                state.accumulated_text.clone(),
-            );
-        }
-        chunks
-    });
+    let stream = transport::translated_stream(
+        response, model, request_id, ProviderStream::Anthropic(Default::default()),
+    );
     build_response(status, sse_headers(), Body::from_stream(stream))
-}
-
-/// SSE parser for Responses API format: handles both `event:` and `data:` lines.
-fn stream_responses_sse<F>(
-    response: reqwest::Response,
-    translator: F,
-) -> impl Stream<Item = Result<Bytes, Infallible>>
-where
-    F: Fn(&str, &str, &mut ChatgptStreamState) -> Vec<String> + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel::<Bytes>(32);
-    tokio::spawn(async move {
-        let mut upstream = response.bytes_stream();
-        let mut line_buf = String::new();
-        let mut event_type = String::new();
-        let mut data_lines: Vec<String> = Vec::new();
-        let mut state = ChatgptStreamState::default();
-        let mut raw_buf: Vec<u8> = Vec::new();
-
-        while let Some(chunk) = upstream.next().await {
-            let Ok(chunk) = chunk else {
-                warn!("chatgpt SSE stream ended with error");
-                break;
-            };
-            raw_buf.extend_from_slice(&chunk);
-            let valid_up_to = match std::str::from_utf8(&raw_buf) {
-                Ok(_) => raw_buf.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            if valid_up_to == 0 {
-                continue;
-            }
-            let text = std::str::from_utf8(&raw_buf[..valid_up_to]).unwrap();
-            for ch in text.chars() {
-                if ch == '\n' {
-                    let line = std::mem::take(&mut line_buf);
-                    let line = line.trim_end_matches('\r');
-
-                    if line.is_empty() {
-                        // Dispatch event
-                        if !data_lines.is_empty() {
-                            let data = data_lines.join("\n");
-                            data_lines.clear();
-                            let et = std::mem::take(&mut event_type);
-                            for out in translator(&et, &data, &mut state) {
-                                if tx.send(Bytes::from(out)).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    } else if let Some(val) = line.strip_prefix("event:") {
-                        event_type = val.trim().to_string();
-                    } else if let Some(val) = line.strip_prefix("data:") {
-                        data_lines.push(val.trim_start().to_string());
-                    }
-                } else {
-                    line_buf.push(ch);
-                }
-            }
-            raw_buf.drain(..valid_up_to);
-        }
-    });
-    futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|b| (Ok(b), rx)) })
 }
 
 fn passthrough_sse(response: reqwest::Response) -> Response {
@@ -1105,94 +851,6 @@ fn passthrough_sse(response: reqwest::Response) -> Response {
             .map_err(|err| anyhow!(err))
     });
     build_response(status, sse_headers(), Body::from_stream(stream))
-}
-
-fn stream_response_body<F>(response: reqwest::Response, translator: F) -> impl Stream<Item = Result<Bytes, Infallible>>
-where
-    F: Fn(&str, &mut StreamState) -> Vec<String> + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel::<Bytes>(32);
-    tokio::spawn(async move {
-        let mut upstream = response.bytes_stream();
-        let mut event_buffer = String::new();
-        let mut data_lines = Vec::new();
-        let mut state = StreamState::default();
-        // Buffer for incomplete UTF-8 sequences at chunk boundaries
-        let mut raw_buf: Vec<u8> = Vec::new();
-
-        let mut chunk_count: u64 = 0;
-        let stream_start = std::time::Instant::now();
-        while let Some(chunk) = upstream.next().await {
-            let Ok(chunk) = chunk else {
-                warn!("upstream SSE stream ended with an error after {chunk_count} chunks");
-                break;
-            };
-            chunk_count += 1;
-            if chunk_count <= 3 || chunk_count % 50 == 0 {
-                tracing::debug!("upstream chunk #{chunk_count} ({} bytes, +{}ms)", chunk.len(), stream_start.elapsed().as_millis());
-            }
-
-            raw_buf.extend_from_slice(&chunk);
-
-            // Decode as much valid UTF-8 as possible, leaving incomplete sequences
-            let valid_up_to = match std::str::from_utf8(&raw_buf) {
-                Ok(_) => raw_buf.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            if valid_up_to == 0 {
-                continue;
-            }
-            let text = std::str::from_utf8(&raw_buf[..valid_up_to]).unwrap();
-
-            for ch in text.chars() {
-                event_buffer.push(ch);
-
-                if ch != '\n' {
-                    continue;
-                }
-
-                let line = event_buffer.trim_end_matches('\n').trim_end_matches('\r').to_string();
-                event_buffer.clear();
-
-                if line.is_empty() {
-                    if data_lines.is_empty() {
-                        continue;
-                    }
-
-                    let data = data_lines.join("\n");
-                    data_lines.clear();
-
-                    if data == "[DONE]" {
-                        tracing::debug!("upstream [DONE] after {chunk_count} chunks, +{}ms", stream_start.elapsed().as_millis());
-                        let _ = tx.send(Bytes::from_static(b"data: [DONE]\n\n")).await;
-                        continue;
-                    }
-
-                    let translated = translator(&data, &mut state);
-                    for event in translated {
-                        if tx.send(Bytes::from(event)).await.is_err() {
-                            tracing::warn!("downstream closed after {chunk_count} chunks");
-                            return;
-                        }
-                    }
-                } else if let Some(data) = line.strip_prefix("data:") {
-                    data_lines.push(data.trim_start().to_string());
-                }
-            }
-            raw_buf.drain(..valid_up_to);
-        }
-
-        if !data_lines.is_empty() {
-            let data = data_lines.join("\n");
-            for event in translator(&data, &mut state) {
-                if tx.send(Bytes::from(event)).await.is_err() {
-                    return;
-                }
-            }
-        }
-    });
-
-    futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (Ok(item), rx)) })
 }
 
 fn build_response(status: reqwest::StatusCode, headers: Vec<(header::HeaderName, HeaderValue)>, body: Body) -> Response {
@@ -1993,6 +1651,34 @@ impl OpenCodeGoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn virtual_tool_only_completion_is_reemitted_with_exact_calls_and_terminal() {
+        let call = json!({"id":"call-exact","type":"function","function":{"name":"lookup","arguments":"{ \"x\": 1 }"}});
+        let completion = json!({"id":"completion-exact","object":"chat.completion","model":"fixture","created":7,
+            "choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[call]},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"cache_read_input_tokens":1}});
+        let response = json_completion_to_sse(Json(completion.clone()).into_response(), "request").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse::Decoder::default().push(&bytes).unwrap();
+        let delta: serde_json::Value = serde_json::from_str(&events[0].1).unwrap();
+        let finish: serde_json::Value = serde_json::from_str(&events[1].1).unwrap();
+        let mut emitted = delta["choices"][0]["delta"]["tool_calls"][0].clone();
+        assert_eq!(emitted.as_object_mut().unwrap().remove("index"), Some(json!(0)));
+        assert_eq!(emitted, call);
+        assert_eq!(delta["id"], "completion-exact");
+        assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(finish["usage"], completion["usage"]);
+        assert_eq!(events[2].1, "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn virtual_response_without_terminal_reason_is_bad_gateway() {
+        let response = Json(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"partial"}}]})).into_response();
+        assert_eq!(json_completion_to_sse(response, "r").await.status(), StatusCode::BAD_GATEWAY);
+    }
 
     #[tokio::test]
     async fn collected_chatgpt_response_preserves_cached_token_details() {

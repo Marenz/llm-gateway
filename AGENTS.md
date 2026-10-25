@@ -48,6 +48,10 @@ src/
     openai_to_anthropic.rs — OpenAI request -> Anthropic request
     anthropic_to_openai.rs — Anthropic response -> OpenAI response
     stream.rs              — Anthropic SSE -> OpenAI SSE stream translation
+    chatgpt.rs             — Responses request + shared stream/collection state machine
+    sse.rs                 — Incremental byte-safe SSE decoder and buffered completion re-emission
+    transport.rs           — HTTP body adapters for translated streams and ChatGPT collection
+    compat_tests.rs        — Offline raw fixtures + loopback HTTP compatibility regressions
 ```
 
 ## Key Design Decisions
@@ -178,10 +182,42 @@ target in order, advancing to the next on a retryable failure.
 - All targets exhausted → returns the last failure response (502 listing tried
   targets + statuses).
 - **Streaming:** virtual-model attempts are forced to `stream:false` so the HTTP
-  status is visible before committing to a body; the client receives a normal
-  JSON completion. Non-virtual requests stream normally.
+  status is visible before committing to a body. For `stream:true` clients the
+  buffered completion is re-emitted as SSE, preserving tool calls (with indices),
+  content, usage and finish reason. Missing terminal reasons yield 502 instead
+  of an invented `stop`. Non-virtual requests stream normally.
 - Shared dispatch: both the virtual loop and the normal path call
   `dispatch_resolved` — the per-provider match lives in exactly one place.
+
+## Native tool-call compatibility
+
+- ChatGPT Responses `item.id` identifies argument events; `call_id` is the public
+  OpenAI tool-call id used by subsequent `role:tool` messages. Never key argument
+  assembly by `call_id` or fall back to index zero on a missing item.
+- ChatGPT buffered and streaming paths share one state machine. Only upstream
+  `response.completed` / `response.incomplete` establishes terminal evidence.
+  Incomplete responses never report successful `tool_calls`: token limits map
+  to `length`, filtering to `content_filter`, other causes to `incomplete`.
+  Failed/error events and EOF without terminal evidence produce an error (502
+  when buffered; an SSE error payload without a success terminal when streamed).
+- Anthropic stream tool headers are emitted at block start; argument fragments
+  keep their original content-block indices, which can be sparse. Block stop
+  emits the initial input for tools without argument deltas (including `{}`).
+  A terminal chunk is deferred until `message_stop`, with a stop reason required.
+- Anthropic `max_tokens` / `model_context_window_exceeded` map to `length`,
+  `refusal` to `content_filter`, `pause_turn` stays `pause_turn`; unrecognized
+  reasons become `unknown:<upstream-reason>`. Missing reasons are errors. Clients
+  must treat only `stop` and `tool_calls` as successful terminal reasons and
+  require a complete stream before executing fully assembled calls.
+- This slice supports ordinary function schemas, `tool_choice:auto`, assistant
+  `content:null` with tool calls and text tool results correlated by id. Signed
+  Anthropic thinking replay is not represented; tool-result images are flattened
+  away by existing text extraction. `required` tool choice combined with thinking
+  can be rejected upstream. These cases are **not** certified by these fixes.
+- `src/translate/fixtures/*.sse` contains synthetic public-shape payloads only.
+  Compatibility tests use in-memory framing or loopback HTTP and no providers.
+  Offline source tests do not certify the deployed binary or live providers;
+  live certification requires separately approved probes.
 
 ## DeepSeek Models
 

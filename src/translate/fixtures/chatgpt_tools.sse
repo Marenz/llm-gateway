@@ -1,0 +1,31 @@
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Checking 👋"}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_alpha","type":"function_call","call_id":"call-A","name":"lookup","arguments":""}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":4,"item":{"id":"fc_beta","type":"function_call","call_id":"call-B","name":"clock","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_alpha","output_index":1,"delta":"{ \"city\": "}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_beta","output_index":4,"delta":"{"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_alpha","output_index":1,"delta":"\"Zürich\" }"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_beta","output_index":4,"delta":"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"fc_alpha","arguments":"{ \"city\": \"Zürich\" }"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":4,"item":{"id":"fc_beta","type":"function_call","call_id":"call-B","name":"clock","arguments":"{}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[{"id":"fc_alpha","type":"function_call","call_id":"call-A","name":"lookup","arguments":"{ \"city\": \"Zürich\" }"},{"id":"fc_beta","type":"function_call","call_id":"call-B","name":"clock","arguments":"{}"}],"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":70}}}}
+
+: fixture complete

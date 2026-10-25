@@ -10,7 +10,8 @@ pub fn translate_response(
     resp: &AnthropicResponse,
     original_model: &str,
     request_id: &str,
-) -> crate::types::OpenAIResponse {
+) -> Result<crate::types::OpenAIResponse, String> {
+    let finish_reason = map_stop_reason(resp.stop_reason.as_deref())?;
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
 
@@ -20,6 +21,11 @@ pub fn translate_response(
             AnthropicContentBlock::ToolUse {
                 id, name, input, ..
             } => {
+                if finish_reason == "tool_calls"
+                    && (id.is_empty() || name.is_empty() || !input.is_object())
+                {
+                    return Err("Anthropic tool turn contains incomplete function call".into());
+                }
                 tool_calls.push(OpenAIToolCall {
                     id: id.clone(),
                     kind: "function".to_string(),
@@ -36,7 +42,11 @@ pub fn translate_response(
         }
     }
 
-    OpenAIResponse {
+    if finish_reason == "tool_calls" && tool_calls.is_empty() {
+        return Err("Anthropic tool turn has no tool calls".into());
+    }
+
+    Ok(OpenAIResponse {
         id: format!("chatcmpl-{request_id}"),
         object: "chat.completion".to_string(),
         created: now_unix(),
@@ -51,7 +61,7 @@ pub fn translate_response(
                 tool_call_id: None,
                 cache_control: None,
             },
-            finish_reason: Some(map_stop_reason(resp.stop_reason.as_deref())),
+            finish_reason: Some(finish_reason),
         }],
         usage: Some(OpenAIUsage {
             prompt_tokens: resp.usage.input_tokens,
@@ -63,7 +73,7 @@ pub fn translate_response(
             cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
             cache_read_input_tokens: resp.usage.cache_read_input_tokens,
         }),
-    }
+    })
 }
 
 pub fn translate_error(err: &AnthropicErrorResponse) -> crate::types::OpenAIErrorResponse {
@@ -77,12 +87,16 @@ pub fn translate_error(err: &AnthropicErrorResponse) -> crate::types::OpenAIErro
     }
 }
 
-fn map_stop_reason(reason: Option<&str>) -> String {
-    match reason {
-        Some("max_tokens") => "length".to_string(),
-        Some("tool_use") => "tool_calls".to_string(),
-        _ => "stop".to_string(),
-    }
+pub fn map_stop_reason(reason: Option<&str>) -> Result<String, String> {
+    Ok(match reason {
+        Some("end_turn" | "stop_sequence") => "stop".into(),
+        Some("max_tokens" | "model_context_window_exceeded") => "length".into(),
+        Some("tool_use") => "tool_calls".into(),
+        Some("refusal") => "content_filter".into(),
+        Some("pause_turn") => "pause_turn".into(),
+        Some(reason) if !reason.is_empty() => format!("unknown:{reason}"),
+        _ => return Err("Anthropic response has no terminal stop_reason".into()),
+    })
 }
 
 fn now_unix() -> u64 {
@@ -118,7 +132,7 @@ mod tests {
         .unwrap();
 
         let translated =
-            serde_json::to_value(translate_response(&response, "model", "req")).unwrap();
+            serde_json::to_value(translate_response(&response, "model", "req").unwrap()).unwrap();
 
         assert_eq!(translated["usage"]["prompt_tokens"], 10);
         assert_eq!(translated["usage"]["completion_tokens"], 5);
@@ -135,12 +149,13 @@ mod tests {
             "role": "assistant",
             "content": [],
             "model": "claude-opus-4-6",
+            "stop_reason": "end_turn",
             "usage": {"input_tokens": 10, "output_tokens": 5}
         }))
         .unwrap();
 
         let translated =
-            serde_json::to_value(translate_response(&response, "model", "req")).unwrap();
+            serde_json::to_value(translate_response(&response, "model", "req").unwrap()).unwrap();
 
         assert!(
             translated["usage"]
@@ -159,6 +174,7 @@ mod tests {
             "role": "assistant",
             "content": [],
             "model": "claude-opus-4-6",
+            "stop_reason": "end_turn",
             "usage": {
                 "input_tokens": 10,
                 "output_tokens": 5,
@@ -169,7 +185,7 @@ mod tests {
         .unwrap();
 
         let translated =
-            serde_json::to_value(translate_response(&response, "model", "req")).unwrap();
+            serde_json::to_value(translate_response(&response, "model", "req").unwrap()).unwrap();
 
         assert_eq!(translated["usage"]["cache_creation_input_tokens"], 0);
         assert_eq!(translated["usage"]["cache_read_input_tokens"], 0);

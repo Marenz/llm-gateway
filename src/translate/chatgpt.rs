@@ -208,102 +208,6 @@ fn extract_text(content: &OpenAIMessageContent) -> String {
     }
 }
 
-// ── Response translation ──────────────────────────────────────────────────────
-
-/// Translate a Responses API JSON response to an OpenAI chat completions response.
-pub fn from_responses_response(resp: &Value, original_model: &str, request_id: &str) -> Value {
-    let output = resp.get("output").and_then(|v| v.as_array());
-    let usage = resp.get("usage");
-
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
-    let mut finish_reason = "stop";
-
-    if let Some(output) = output {
-        for item in output {
-            match item.get("type").and_then(|t| t.as_str()) {
-                Some("message") => {
-                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
-                        for block in content {
-                            if block.get("type").and_then(|t| t.as_str()) == Some("output_text") {
-                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                    text_parts.push(text.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                Some("function_call") => {
-                    finish_reason = "tool_calls";
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("{}");
-                    tool_calls.push(json!({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments,
-                        }
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut message = json!({
-        "role": "assistant",
-        "content": text_parts.join(""),
-    });
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = json!(tool_calls);
-    }
-
-    let (input_tokens, output_tokens, cached_tokens) = if let Some(u) = usage {
-        (
-            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            u.get("input_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64),
-        )
-    } else {
-        (0, 0, None)
-    };
-
-    let mut usage = json!({
-        "prompt_tokens": input_tokens,
-        "completion_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
-    });
-    if let Some(cached_tokens) = cached_tokens {
-        usage["cache_read_input_tokens"] = json!(cached_tokens);
-    }
-
-    json!({
-        "id": format!("chatcmpl-{request_id}"),
-        "object": "chat.completion",
-        "created": now_unix(),
-        "model": original_model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }],
-        "usage": usage
-    })
-}
-
 // ── Stream translation ────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -312,10 +216,143 @@ pub struct ChatgptStreamState {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: Option<u64>,
-    /// call_id -> (index, name)
-    pub tool_calls: HashMap<String, (usize, String)>,
-    pub tool_call_count: usize,
+    /// Responses item.id -> stable OpenAI tool-call index. NOT the public call_id.
+    tool_indices: HashMap<String, usize>,
+    tool_calls: Vec<Value>,
     pub accumulated_text: String,
+    refusal: String,
+    finish_reason: Option<String>,
+    failure: Option<String>,
+}
+
+impl ChatgptStreamState {
+    pub fn failed(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    pub fn fail(&mut self, message: impl Into<String>) -> Vec<String> {
+        let message = message.into();
+        if self.failure.is_some() {
+            return vec![];
+        }
+        self.failure = Some(message.clone());
+        vec![super::sse::error(&message)]
+    }
+
+    pub fn finish(&self) -> Result<(), String> {
+        if let Some(error) = &self.failure {
+            Err(error.clone())
+        } else if self.finish_reason.is_none() {
+            Err("ChatGPT stream ended without a terminal response event".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn usage(&self) -> Value {
+        let mut usage = json!({
+            "prompt_tokens": self.input_tokens,
+            "completion_tokens": self.output_tokens,
+            "total_tokens": self.input_tokens + self.output_tokens,
+        });
+        if let Some(cached_tokens) = self.cached_tokens {
+            usage["cache_read_input_tokens"] = json!(cached_tokens);
+        }
+        usage
+    }
+
+    /// The same state machine assembles buffered and streaming responses.
+    pub fn completion(&self, model: &str, request_id: &str) -> Result<Value, String> {
+        self.finish()?;
+        let mut message = json!({"role": "assistant", "content": self.accumulated_text});
+        if !self.refusal.is_empty() {
+            message["refusal"] = json!(self.refusal);
+        }
+        if !self.tool_calls.is_empty() {
+            message["tool_calls"] = json!(self.tool_calls);
+        }
+        Ok(json!({
+            "id": format!("chatcmpl-{request_id}"), "object": "chat.completion",
+            "created": now_unix(), "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": self.finish_reason}],
+            "usage": self.usage()
+        }))
+    }
+
+    fn register_call(&mut self, item: &Value) -> Result<Value, String> {
+        let item_id = required_string(item, "id")?;
+        let call_id = required_string(item, "call_id")?;
+        let name = required_string(item, "name")?;
+        if self.tool_indices.contains_key(item_id)
+            || self.tool_calls.iter().any(|call| call["id"] == call_id)
+        {
+            return Err("duplicate Responses function-call identity".into());
+        }
+        let index = self.tool_calls.len();
+        let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+        let call =
+            json!({"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}});
+        self.tool_calls.push(call.clone());
+        self.tool_indices.insert(item_id.to_string(), index);
+        let mut delta = call;
+        delta["index"] = json!(index);
+        Ok(json!({"tool_calls":[delta]}))
+    }
+
+    fn append_arguments(&mut self, item_id: &str, delta: &str) -> Result<Value, String> {
+        let index = *self
+            .tool_indices
+            .get(item_id)
+            .ok_or("arguments reference an unknown Responses item_id")?;
+        let args = self.tool_calls[index]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        self.tool_calls[index]["function"]["arguments"] = json!(format!("{args}{delta}"));
+        Ok(json!({"tool_calls":[{"index":index,"function":{"arguments":delta}}]}))
+    }
+
+    fn final_arguments(&mut self, item_id: &str, arguments: &str) -> Result<Value, String> {
+        let index = *self
+            .tool_indices
+            .get(item_id)
+            .ok_or("arguments reference an unknown Responses item_id")?;
+        let prefix = self.tool_calls[index]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let remaining = arguments
+            .strip_prefix(prefix)
+            .ok_or("final function arguments contradict streamed arguments")?
+            .to_string();
+        self.append_arguments(item_id, &remaining)
+    }
+
+    fn reconcile_call(&mut self, item: &Value) -> Result<Value, String> {
+        let item_id = required_string(item, "id")?;
+        let index = *self
+            .tool_indices
+            .get(item_id)
+            .ok_or("unknown completed function call")?;
+        let call = &self.tool_calls[index];
+        if call["id"] != required_string(item, "call_id")?
+            || call["function"]["name"] != required_string(item, "name")?
+        {
+            return Err("completed function-call identity changed".into());
+        }
+        self.final_arguments(
+            item_id,
+            item.get("arguments")
+                .and_then(Value::as_str)
+                .ok_or("completed function call has no arguments")?,
+        )
+    }
+}
+
+fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("Responses event missing {key}"))
 }
 
 /// Translate a Responses API SSE event data string to OpenAI SSE lines.
@@ -326,130 +363,185 @@ pub fn translate_stream_event(
     message_id: &str,
     state: &mut ChatgptStreamState,
 ) -> Vec<String> {
-    let Ok(data) = serde_json::from_str::<Value>(event_data) else {
+    if state.failure.is_some() {
         return vec![];
+    }
+    if event_data == "[DONE]" {
+        return if state.finish_reason.is_some() {
+            vec![]
+        } else {
+            state.fail("ChatGPT [DONE] arrived without a terminal response event")
+        };
+    }
+    let data = match serde_json::from_str::<Value>(event_data) {
+        Ok(data) => data,
+        Err(_) => return state.fail("invalid JSON in ChatGPT SSE event"),
     };
+    let event_type = if event_type.is_empty() {
+        data.get("type").and_then(Value::as_str).unwrap_or("")
+    } else {
+        event_type
+    };
+    if state.finish_reason.is_some() {
+        return state.fail("ChatGPT event arrived after terminal response");
+    }
+    match translate_event(event_type, &data, model, message_id, state) {
+        Ok(chunks) => chunks,
+        Err(error) => state.fail(error),
+    }
+}
 
+fn translate_event(
+    event_type: &str,
+    data: &Value,
+    model: &str,
+    message_id: &str,
+    state: &mut ChatgptStreamState,
+) -> Result<Vec<String>, String> {
+    let mut deltas = Vec::new();
+    let mut terminal = None;
     match event_type {
         "response.output_text.delta" => {
-            let delta = data.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-            if delta.is_empty() {
-                return vec![];
-            }
+            let delta = data
+                .get("delta")
+                .and_then(Value::as_str)
+                .ok_or("missing text delta")?;
             state.accumulated_text.push_str(delta);
-            let mut chunks = vec![];
-            maybe_role_chunk(model, message_id, state, &mut chunks);
-            chunks.push(sse(json!({
-                "id": format!("chatcmpl-{message_id}"),
-                "object": "chat.completion.chunk",
-                "created": now_unix(),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
-            })));
-            chunks
+            deltas.push(json!({"content": delta}));
         }
-
+        "response.refusal.delta" => {
+            let delta = data
+                .get("delta")
+                .and_then(Value::as_str)
+                .ok_or("missing refusal delta")?;
+            state.refusal.push_str(delta);
+            deltas.push(json!({"refusal":delta}));
+        }
         "response.output_item.added" => {
-            // When a function_call item appears, register it
             if let Some(item) = data.get("item") {
-                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let idx = state.tool_call_count;
-                    state.tool_call_count += 1;
-                    state
-                        .tool_calls
-                        .insert(call_id.clone(), (idx, name.clone()));
-
-                    let mut chunks = vec![];
-                    maybe_role_chunk(model, message_id, state, &mut chunks);
-                    chunks.push(sse(json!({
-                        "id": format!("chatcmpl-{message_id}"),
-                        "object": "chat.completion.chunk",
-                        "created": now_unix(),
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {
-                            "tool_calls": [{"index": idx, "id": call_id, "type": "function", "function": {"name": name, "arguments": ""}}]
-                        }, "finish_reason": null}]
-                    })));
-                    return chunks;
+                if item["type"] == "function_call" {
+                    deltas.push(state.register_call(item)?);
                 }
             }
-            vec![]
         }
-
         "response.function_call_arguments.delta" => {
-            // Streaming tool call arguments
-            let delta = data.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-            if delta.is_empty() {
-                return vec![];
-            }
-            // Find the tool call index by item_id (call_id in this context)
-            let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-            let idx = state.tool_calls.get(item_id).map(|(i, _)| *i).unwrap_or(0);
-            vec![sse(json!({
-                "id": format!("chatcmpl-{message_id}"),
-                "object": "chat.completion.chunk",
-                "created": now_unix(),
-                "model": model,
-                "choices": [{"index": 0, "delta": {
-                    "tool_calls": [{"index": idx, "function": {"arguments": delta}}]
-                }, "finish_reason": null}]
-            }))]
+            deltas.push(
+                state.append_arguments(
+                    required_string(data, "item_id")?,
+                    data.get("delta")
+                        .and_then(Value::as_str)
+                        .ok_or("missing arguments delta")?,
+                )?,
+            );
         }
-
+        "response.function_call_arguments.done" => {
+            deltas.push(
+                state.final_arguments(
+                    required_string(data, "item_id")?,
+                    data.get("arguments")
+                        .and_then(Value::as_str)
+                        .ok_or("missing final arguments")?,
+                )?,
+            );
+        }
+        "response.output_item.done" => {
+            if let Some(item) = data
+                .get("item")
+                .filter(|item| item["type"] == "function_call")
+            {
+                deltas.push(state.reconcile_call(item)?);
+            }
+        }
         "response.completed" | "response.incomplete" => {
+            let response = data
+                .get("response")
+                .filter(|response| response.is_object())
+                .ok_or("terminal event has no response")?;
+            let expected = if event_type == "response.completed" {
+                "completed"
+            } else {
+                "incomplete"
+            };
+            if response
+                .get("status")
+                .is_some_and(|status| status != expected)
+            {
+                return Err("terminal event contradicts response status".into());
+            }
             if let Some(usage) = data.get("response").and_then(|r| r.get("usage")) {
                 apply_usage(state, usage);
             }
-            let finish_reason = if !state.tool_calls.is_empty() {
-                "tool_calls"
-            } else if event_type == "response.incomplete" {
-                "length"
-            } else {
-                "stop"
-            };
-            let mut usage = json!({
-                "prompt_tokens": state.input_tokens,
-                "completion_tokens": state.output_tokens,
-                "total_tokens": state.input_tokens + state.output_tokens,
-            });
-            if let Some(cached_tokens) = state.cached_tokens {
-                usage["cache_read_input_tokens"] = json!(cached_tokens);
+            if let Some(output) = response.get("output").and_then(Value::as_array) {
+                for item in output.iter().filter(|item| item["type"] == "function_call") {
+                    if !state
+                        .tool_indices
+                        .contains_key(required_string(item, "id")?)
+                    {
+                        deltas.push(state.register_call(item)?);
+                    }
+                    deltas.push(state.reconcile_call(item)?);
+                }
             }
-            vec![
-                sse(json!({
-                    "id": format!("chatcmpl-{message_id}"),
-                    "object": "chat.completion.chunk",
-                    "created": now_unix(),
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                    "usage": usage
-                })),
-                "data: [DONE]\n\n".to_string(),
-            ]
+            let reason = if event_type == "response.incomplete" {
+                match response
+                    .pointer("/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                {
+                    Some("max_output_tokens") => "length",
+                    Some("content_filter") => "content_filter",
+                    _ => "incomplete",
+                }
+            } else {
+                for call in &state.tool_calls {
+                    let args = call["function"]["arguments"].as_str().unwrap();
+                    if !serde_json::from_str::<Value>(args).is_ok_and(|v| v.is_object()) {
+                        return Err(
+                            "completed response contains incomplete function arguments".into()
+                        );
+                    }
+                }
+                if !state.refusal.is_empty() {
+                    "content_filter"
+                } else if state.tool_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                }
+            };
+            terminal = Some(reason.to_string());
         }
-
-        "error" => {
-            let msg = data
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            vec![sse(json!({
-                "error": { "message": msg, "type": "upstream_error" }
-            }))]
+        "error" | "response.failed" => {
+            return Err(data
+                .pointer("/response/error/message")
+                .or_else(|| data.pointer("/error/message"))
+                .or_else(|| data.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("ChatGPT response failed")
+                .to_string());
         }
-
-        _ => vec![],
+        _ => {}
     }
+    let mut chunks = Vec::new();
+    if !deltas.is_empty() {
+        maybe_role_chunk(model, message_id, state, &mut chunks);
+    }
+    for delta in deltas {
+        chunks.push(sse(json!({
+            "id":format!("chatcmpl-{message_id}"), "object":"chat.completion.chunk",
+            "created":now_unix(), "model":model,
+            "choices":[{"index":0,"delta":delta,"finish_reason":null}]
+        })));
+    }
+    if let Some(reason) = terminal {
+        state.finish_reason = Some(reason.clone());
+        chunks.push(sse(json!({
+            "id":format!("chatcmpl-{message_id}"), "object":"chat.completion.chunk",
+            "created":now_unix(), "model":model,
+            "choices":[{"index":0,"delta":{},"finish_reason":reason}], "usage":state.usage()
+        })));
+        chunks.push("data: [DONE]\n\n".into());
+    }
+    Ok(chunks)
 }
 
 pub fn apply_usage(state: &mut ChatgptStreamState, usage: &Value) {
@@ -501,7 +593,7 @@ fn now_unix() -> u64 {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{ChatgptStreamState, from_responses_response, translate_stream_event};
+    use super::{ChatgptStreamState, translate_stream_event};
 
     #[test]
     fn collected_response_shape_reports_cached_subset_without_double_counting() {
@@ -514,7 +606,15 @@ mod tests {
             }
         });
 
-        let completion = from_responses_response(&response, "model", "id");
+        let mut state = ChatgptStreamState::default();
+        translate_stream_event(
+            "response.completed",
+            &json!({"response":response}).to_string(),
+            "model",
+            "id",
+            &mut state,
+        );
+        let completion = state.completion("model", "id").unwrap();
 
         assert_eq!(completion["usage"]["prompt_tokens"], 100);
         assert_eq!(completion["usage"]["cache_read_input_tokens"], 70);
