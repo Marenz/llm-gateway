@@ -1,3 +1,4 @@
 /target/
 *.json
 !gateway.example.json
+!src/translate/fixtures/*.json

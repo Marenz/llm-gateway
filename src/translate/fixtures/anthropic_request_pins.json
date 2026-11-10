@@ -1,0 +1,573 @@
+[
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first question\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"first answer\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"volatile envelope\\n\\nsecond question\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"stable system prefix\",\"cache_control\":{\"type\":\"ephemeral\"}}]}",
+    "name": "adapsis_system_and_assistant_text",
+    "request": {
+      "max_tokens": 1024,
+      "messages": [
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "stable system prefix",
+          "role": "system"
+        },
+        {
+          "content": "first question",
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "first answer",
+          "role": "assistant"
+        },
+        {
+          "content": "volatile envelope\n\nsecond question",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"question\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call-A\",\"name\":\"lookup\",\"input\":{\"city\":\"Zürich\"}},{\"type\":\"tool_use\",\"id\":\"call-B\",\"name\":\"lookup\",\"input\":{},\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-A\",\"content\":\"result A\"},{\"type\":\"tool_result\",\"tool_use_id\":\"call-B\",\"content\":\"result B\"},{\"type\":\"text\",\"text\":\"runtime envelope\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"stable system prefix\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"tools\":[{\"name\":\"lookup\",\"description\":\"find\",\"input_schema\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}}],\"tool_choice\":{\"type\":\"auto\"},\"stream\":true}",
+    "name": "adapsis_assistant_tool_calls_then_merged_results_and_user",
+    "request": {
+      "messages": [
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "stable system prefix",
+          "role": "system"
+        },
+        {
+          "content": "question",
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"city\":\"Zürich\"}",
+                "name": "lookup"
+              },
+              "id": "call-A",
+              "type": "function"
+            },
+            {
+              "function": {
+                "arguments": "{}",
+                "name": "lookup"
+              },
+              "id": "call-B",
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "content": "result A",
+          "role": "tool",
+          "tool_call_id": "call-A"
+        },
+        {
+          "content": "result B",
+          "role": "tool",
+          "tool_call_id": "call-B"
+        },
+        {
+          "content": "runtime envelope",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5",
+      "stream": true,
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "function": {
+            "description": "find",
+            "name": "lookup",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"question\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"answer\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"next\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"stable system prefix\",\"cache_control\":{\"type\":\"ephemeral\"}},{\"type\":\"text\",\"text\":\"volatile system tail\"}]}",
+    "name": "adapsis_stable_and_volatile_system_text",
+    "request": {
+      "messages": [
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "stable system prefix",
+          "role": "system"
+        },
+        {
+          "content": "volatile system tail",
+          "role": "system"
+        },
+        {
+          "content": "question",
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "answer",
+          "role": "assistant"
+        },
+        {
+          "content": "next",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"one\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"two\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"three\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"let me look\"},{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"lookup\",\"input\":{\"city\":\"Bern\"},\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-1\",\"content\":\"sunny\"},{\"type\":\"text\",\"text\":\"runtime envelope\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"stable system prefix\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"tools\":[{\"name\":\"lookup\",\"description\":\"find\",\"input_schema\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}}],\"thinking\":{\"budget_tokens\":2048,\"type\":\"enabled\"}}",
+    "name": "adapsis_three_boundaries_with_text_and_tool_call",
+    "request": {
+      "messages": [
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "stable system prefix",
+          "role": "system"
+        },
+        {
+          "content": "one",
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "two",
+          "role": "assistant"
+        },
+        {
+          "content": "three",
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "let me look",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"city\":\"Bern\"}",
+                "name": "lookup"
+              },
+              "id": "call-1",
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "content": "sunny",
+          "role": "tool",
+          "tool_call_id": "call-1"
+        },
+        {
+          "content": "runtime envelope",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5",
+      "reasoning_effort": "medium",
+      "tools": [
+        {
+          "function": {
+            "description": "find",
+            "name": "lookup",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"question\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"answer\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"next\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"stable system prefix\",\"cache_control\":{\"ttl\":\"1h\",\"type\":\"ephemeral\"}}]}",
+    "name": "adapsis_one_hour_system_then_default_assistant",
+    "request": {
+      "messages": [
+        {
+          "cache_control": {
+            "ttl": "1h",
+            "type": "ephemeral"
+          },
+          "content": "stable system prefix",
+          "role": "system"
+        },
+        {
+          "content": "question",
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "answer",
+          "role": "assistant"
+        },
+        {
+          "content": "next",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"aGVsbG8=\"}}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"a picture\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"thanks\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"stable system prefix\",\"cache_control\":{\"type\":\"ephemeral\"}}]}",
+    "name": "adapsis_image_user_and_assistant_boundary",
+    "request": {
+      "messages": [
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "stable system prefix",
+          "role": "system"
+        },
+        {
+          "content": [
+            {
+              "text": "describe",
+              "type": "text"
+            },
+            {
+              "image_url": {
+                "url": "data:image/png;base64,aGVsbG8="
+              },
+              "type": "image_url"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "a picture",
+          "role": "assistant"
+        },
+        {
+          "content": "thanks",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"one\"},{\"type\":\"text\",\"text\":\"two\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"assistant\",\"content\":\"three\"}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}]}",
+    "name": "boundary_on_last_of_merged_user_messages",
+    "request": {
+      "messages": [
+        {
+          "content": "one",
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "two",
+          "role": "user"
+        },
+        {
+          "content": "three",
+          "role": "assistant"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"one\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"two\\n\\nthree\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"four\"}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}]}",
+    "name": "boundary_on_last_of_merged_assistant_texts",
+    "request": {
+      "messages": [
+        {
+          "content": "one",
+          "role": "user"
+        },
+        {
+          "content": "two",
+          "role": "assistant"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "three",
+          "role": "assistant"
+        },
+        {
+          "content": "four",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"question\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call-A\",\"name\":\"lookup\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"call-B\",\"name\":\"lookup\",\"input\":{},\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-A\",\"content\":\"result A\"},{\"type\":\"tool_result\",\"tool_use_id\":\"call-B\",\"content\":\"result B\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}],\"tools\":[{\"name\":\"lookup\",\"description\":\"find\",\"input_schema\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}}]}",
+    "name": "boundary_on_last_of_merged_tool_results",
+    "request": {
+      "messages": [
+        {
+          "content": "question",
+          "role": "user"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{}",
+                "name": "lookup"
+              },
+              "id": "call-A",
+              "type": "function"
+            },
+            {
+              "function": {
+                "arguments": "{}",
+                "name": "lookup"
+              },
+              "id": "call-B",
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "content": "result A",
+          "role": "tool",
+          "tool_call_id": "call-A"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "result B",
+          "role": "tool",
+          "tool_call_id": "call-B"
+        }
+      ],
+      "model": "claude-opus-5",
+      "tools": [
+        {
+          "function": {
+            "description": "find",
+            "name": "lookup",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":5,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"filler\",\"cache_control\":{\"ttl\":\"1h\",\"type\":\"ephemeral\"}}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}]}",
+    "name": "boundary_on_single_user_message_with_ttl",
+    "request": {
+      "max_tokens": 5,
+      "messages": [
+        {
+          "cache_control": {
+            "ttl": "1h",
+            "type": "ephemeral"
+          },
+          "content": "filler",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"one\"}]},{\"role\":\"assistant\",\"content\":\"two\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"three\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"four\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"five\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"system\",\"cache_control\":{\"type\":\"ephemeral\"}}]}",
+    "name": "legacy_heuristic_conversation",
+    "request": {
+      "messages": [
+        {
+          "content": "system",
+          "role": "system"
+        },
+        {
+          "content": "one",
+          "role": "user"
+        },
+        {
+          "content": "two",
+          "role": "assistant"
+        },
+        {
+          "content": "three",
+          "role": "user"
+        },
+        {
+          "content": "four",
+          "role": "assistant"
+        },
+        {
+          "content": "five",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"cache_control\":{\"type\":\"ephemeral\"}}]}",
+    "name": "legacy_heuristic_single_user_message",
+    "request": {
+      "messages": [
+        {
+          "content": "hello",
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5"
+    }
+  },
+  {
+    "expected": "{\"model\":\"claude-opus-5\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"question\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call-A\",\"name\":\"lookup\",\"input\":{\"city\":\"Bern\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-A\",\"content\":\"result A\"},{\"type\":\"text\",\"text\":\"runtime envelope\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://example.com/a.png\"},\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"system one\"},{\"type\":\"text\",\"text\":\"system two\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"tools\":[{\"name\":\"lookup\",\"description\":\"find\",\"input_schema\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}}],\"tool_choice\":{\"type\":\"any\"}}",
+    "name": "legacy_heuristic_tools_merged_results_and_empty_assistant",
+    "request": {
+      "messages": [
+        {
+          "content": "system one",
+          "role": "system"
+        },
+        {
+          "content": "system two",
+          "role": "system"
+        },
+        {
+          "content": "question",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"city\":\"Bern\"}",
+                "name": "lookup"
+              },
+              "id": "call-A",
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "content": "result A",
+          "role": "tool",
+          "tool_call_id": "call-A"
+        },
+        {
+          "content": "runtime envelope",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant"
+        },
+        {
+          "content": [
+            {
+              "text": "look",
+              "type": "text"
+            },
+            {
+              "image_url": {
+                "url": "https://example.com/a.png"
+              },
+              "type": "image_url"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "model": "claude-opus-5",
+      "tool_choice": "required",
+      "tools": [
+        {
+          "function": {
+            "description": "find",
+            "name": "lookup",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    }
+  }
+]

@@ -758,6 +758,26 @@ mod tests {
         assert!(error.contains("same-role merging"));
     }
 
+    /// Requests whose exact upstream bytes must not change: what Adapsis sends
+    /// today (boundaries on system text and assistant messages), boundaries on
+    /// the last message of a merged run, and the legacy heuristic. `expected`
+    /// was recorded from the translation at c4f0d36, before boundaries were
+    /// placed per source message.
+    #[test]
+    fn pinned_requests_translate_byte_identically() {
+        let pins: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/anthropic_request_pins.json")).unwrap();
+        let pins = pins.as_array().unwrap();
+        assert_eq!(pins.len(), 13);
+        for pin in pins {
+            let name = pin["name"].as_str().unwrap();
+            let request: OpenAIRequest = serde_json::from_value(pin["request"].clone()).unwrap();
+            let translated = translate_request(&request).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let actual = serde_json::to_string(&translated).unwrap();
+            assert_eq!(actual, pin["expected"].as_str().unwrap(), "pin {name} changed");
+        }
+    }
+
     #[test]
     fn malformed_cache_control_is_rejected() {
         let request: OpenAIRequest = serde_json::from_value(json!({
