@@ -302,6 +302,11 @@ async fn chat_completions(
         Ok(Json(req)) => req,
         Err(rejection) => return body_rejection(rejection, state.max_request_bytes),
     };
+    // Checked once here so every route, and every virtual-model target,
+    // rejects a malformed key the same way.
+    if let Err(message) = req.client_prompt_cache_key() {
+        return error_response(StatusCode::BAD_REQUEST, message);
+    }
     let request_id = Uuid::new_v4().simple().to_string();
     let started_at = std::time::Instant::now();
 
@@ -483,10 +488,20 @@ async fn dispatch_resolved(
             };
             let mut upstream_req = chatgpt_translate::to_responses_request(req);
             upstream_req["model"] = serde_json::Value::String(resolved.upstream_model.clone());
+            // Validated in `chat_completions`; an invalid key cannot reach here.
+            let client_key = req.client_prompt_cache_key().ok().flatten();
+            let cache_key =
+                chatgpt_translate::apply_prompt_cache_key(&mut upstream_req, client_key);
+            tracing::debug!(
+                request_id = %request_id,
+                cache_key = %cache_key,
+                source = if client_key.is_some() { "client" } else { "derived" },
+                "chatgpt prompt cache key"
+            );
 
             if req.stream.unwrap_or(false) {
                 upstream_req["stream"] = serde_json::Value::Bool(true);
-                match provider.send_json("/responses", &upstream_req).await {
+                match provider.send_json("/responses", &upstream_req, &cache_key).await {
                     Ok(response) => {
                         translate_chatgpt_sse(response, req.model.clone(), request_id.to_string()).await
                     }
@@ -498,7 +513,7 @@ async fn dispatch_resolved(
             } else {
                 // Codex endpoint requires stream:true — send streaming and collect into one response
                 upstream_req["stream"] = serde_json::Value::Bool(true);
-                match provider.send_json("/responses", &upstream_req).await {
+                match provider.send_json("/responses", &upstream_req, &cache_key).await {
                     Ok(response) => {
                         if !response.status().is_success() {
                             return proxy_json_response(response).await;
@@ -520,6 +535,11 @@ async fn dispatch_resolved(
                 return error_response(StatusCode::BAD_GATEWAY, "provider not configured");
             };
             let mut upstream_request = openai_passthrough_request(req, &resolved.upstream_model);
+            // Only the OpenAI API is known to accept the key; the other
+            // providers behind this arm keep receiving the request without it.
+            if resolved.provider_kind == ProviderKind::Openai {
+                upstream_request.prompt_cache_key = req.prompt_cache_key.clone();
+            }
             // XiaoMiMo supports OpenAI-style cache_control markers on content parts
             if resolved.provider_kind == ProviderKind::XiaomiMimo {
                 apply_openai_cache_markers(&mut upstream_request.messages);
@@ -975,6 +995,8 @@ fn apply_openai_cache_markers(messages: &mut Vec<crate::types::OpenAIMessage>) {
 fn openai_passthrough_request(req: &OpenAIRequest, upstream_model: &str) -> OpenAIRequest {
     let mut upstream = req.clone();
     upstream.model = upstream_model.to_string();
+    // Gateway-level field: the caller re-adds it for routes that forward it.
+    upstream.prompt_cache_key = None;
     for message in &mut upstream.messages {
         message.cache_control = None;
     }
@@ -1403,6 +1425,7 @@ impl ChatgptProvider {
         &self,
         path: &str,
         body: &T,
+        session_id: &str,
     ) -> anyhow::Result<reqwest::Response> {
         let access_token = self.get_access_token().await?;
         let account_id = self
@@ -1419,6 +1442,9 @@ impl ChatgptProvider {
             .header("accept", "text/event-stream")
             .header("originator", "codex_cli_rs")
             .header("user-agent", "codex_cli_rs/0.0.0 (Unknown 0; unknown) unknown")
+            // Cache affinity: the backend routes requests that share this
+            // header to the same cache. Same value as `prompt_cache_key`.
+            .header("session-id", session_id)
             .json(body);
 
         if let Some(account_id) = &account_id {
@@ -1915,6 +1941,257 @@ mod tests {
                 .get("cache_creation_input_tokens")
                 .is_none()
         );
+    }
+
+    // ── Prompt cache key ───────────────────────────────────────────────────
+
+    /// One upstream request as the provider saw it.
+    struct Seen {
+        path: String,
+        session_id: Option<String>,
+        body: serde_json::Value,
+    }
+    type Recorded = Arc<std::sync::Mutex<Vec<Seen>>>;
+
+    /// Removes the test token file when the test ends.
+    struct TokenFile(std::path::PathBuf);
+    impl Drop for TokenFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Gateway whose chatgpt, openai and openai_compatible providers all point
+    /// at one upstream that records what it receives.
+    async fn spawn_recording_gateway() -> (std::net::SocketAddr, Recorded, TokenFile) {
+        async fn record(
+            State(recorded): State<Recorded>,
+            uri: axum::http::Uri,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Response {
+            recorded.lock().unwrap().push(Seen {
+                path: uri.path().to_string(),
+                session_id: headers
+                    .get("session-id")
+                    .map(|value| value.to_str().unwrap().to_string()),
+                body: serde_json::from_slice(&body).unwrap(),
+            });
+            if uri.path() == "/responses" {
+                let sse = concat!(
+                    "event: response.completed\n",
+                    "data: {\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n"
+                );
+                return build_response(StatusCode::OK, sse_headers(), Body::from(sse));
+            }
+            Json(json!({
+                "id": "mock", "object": "chat.completion", "created": 0, "model": "mock",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }))
+            .into_response()
+        }
+
+        let recorded = Recorded::default();
+        let upstream_app = Router::new()
+            .route("/responses", post(record))
+            .route("/chat/completions", post(record))
+            .with_state(recorded.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        tokio::spawn(async move { serve(listener, upstream_app).await.unwrap() });
+
+        // A token that is valid for the whole test, so nothing is refreshed.
+        let token_file = std::env::temp_dir().join(format!(
+            "llm-gateway-test-chatgpt-{}-{}.json",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &token_file,
+            json!({"access_token": "test", "token_type": "Bearer", "expires_at": i64::MAX}).to_string(),
+        )
+        .unwrap();
+
+        let config: GatewayConfig = serde_json::from_value(json!({
+            "providers": [
+                {"type": "chatgpt", "name": "chatgpt", "api_base": format!("http://{upstream}"),
+                 "token_file": token_file},
+                {"type": "openai", "name": "openai", "api_base": format!("http://{upstream}")},
+                {"type": "openai_compatible", "name": "mock", "api_base": format!("http://{upstream}"),
+                 "models": ["mock-model"]}
+            ]
+        }))
+        .unwrap();
+        let mut chatgpt = None;
+        let mut providers = std::collections::HashMap::new();
+        for provider in &config.providers {
+            match provider {
+                ProviderConfig::Chatgpt(cfg) => chatgpt = Some(ChatgptProvider::new(cfg.clone())),
+                ProviderConfig::Openai(cfg) => {
+                    providers.insert(cfg.name.clone(), OpenAICompatProvider::from_openai(cfg.clone()));
+                }
+                ProviderConfig::OpenaiCompatible(cfg) => {
+                    providers.insert(cfg.name.clone(), OpenAICompatProvider::new(cfg.clone()));
+                }
+                _ => unreachable!(),
+            }
+        }
+        let state = Arc::new(AppState {
+            anthropic_pool: AnthropicPool::new(vec![]),
+            chatgpt,
+            openai_compat_providers: providers,
+            opencode_go: None,
+            zen: None,
+            deepseek: None,
+            deepinfra: None,
+            model_resolver: ModelResolver::from_config(&config),
+            master_key: None,
+            virtual_models: Default::default(),
+            max_request_bytes: config.max_request_bytes,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move { serve(listener, app).await.unwrap() });
+        (gateway, recorded, TokenFile(token_file))
+    }
+
+    async fn post_chat(gateway: std::net::SocketAddr, body: serde_json::Value) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("http://{gateway}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn is_uuid(value: &str) -> bool {
+        Uuid::parse_str(value).is_ok() && value.len() == 36
+    }
+
+    #[tokio::test]
+    async fn chatgpt_route_sends_client_cache_key_as_body_field_and_session_header() {
+        let (gateway, recorded, _token_file) = spawn_recording_gateway().await;
+        for stream in [false, true] {
+            let response = post_chat(
+                gateway,
+                json!({
+                    "model": "chatgpt/gpt-test",
+                    "stream": stream,
+                    "prompt_cache_key": "agent_1:user_2",
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let _ = response.bytes().await.unwrap();
+        }
+        let seen = recorded.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for request in seen.iter() {
+            assert_eq!(request.path, "/responses");
+            assert_eq!(request.body["prompt_cache_key"], "agent_1:user_2");
+            assert_eq!(request.session_id.as_deref(), Some("agent_1:user_2"));
+            assert_eq!(request.body["model"], "gpt-test");
+        }
+    }
+
+    #[tokio::test]
+    async fn chatgpt_route_derives_one_key_per_conversation_without_touching_content() {
+        let (gateway, recorded, _token_file) = spawn_recording_gateway().await;
+        let turn_1 = json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "first question"}
+        ]);
+        let mut turn_2 = turn_1.clone();
+        turn_2.as_array_mut().unwrap().extend([
+            json!({"role": "assistant", "content": "first answer"}),
+            json!({"role": "user", "content": "second question"}),
+        ]);
+        let other = json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "a different question"}
+        ]);
+        for messages in [&turn_1, &turn_2, &other] {
+            let response =
+                post_chat(gateway, json!({"model": "chatgpt/gpt-test", "messages": messages})).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+
+        let seen = recorded.lock().unwrap();
+        let keys: Vec<&str> = seen
+            .iter()
+            .map(|request| request.body["prompt_cache_key"].as_str().unwrap())
+            .collect();
+        assert!(is_uuid(keys[0]), "{}", keys[0]);
+        assert_eq!(keys[0], keys[1], "a growing conversation keeps its key");
+        assert_ne!(keys[0], keys[2], "another conversation gets another key");
+        for request in seen.iter() {
+            assert_eq!(request.session_id.as_deref(), request.body["prompt_cache_key"].as_str());
+        }
+
+        // The key is a routing hint: the translated content is exactly what
+        // the translation produces without it.
+        let request: OpenAIRequest =
+            serde_json::from_value(json!({"model": "chatgpt/gpt-test", "messages": turn_2})).unwrap();
+        let mut expected = chatgpt_translate::to_responses_request(&request);
+        expected["model"] = json!("gpt-test");
+        expected["stream"] = json!(true);
+        let mut sent = seen[1].body.clone();
+        assert!(sent.as_object_mut().unwrap().remove("prompt_cache_key").is_some());
+        assert_eq!(sent, expected);
+    }
+
+    #[tokio::test]
+    async fn openai_route_forwards_client_cache_key_and_other_routes_do_not() {
+        let (gateway, recorded, _token_file) = spawn_recording_gateway().await;
+        for model in ["openai/gpt-test", "mock-model"] {
+            for key in [Some("agent_1:user_2"), None] {
+                let mut body = json!({"model": model, "messages": [{"role": "user", "content": "hello"}]});
+                if let Some(key) = key {
+                    body["prompt_cache_key"] = json!(key);
+                }
+                assert_eq!(post_chat(gateway, body).await.status(), reqwest::StatusCode::OK);
+            }
+        }
+        let seen = recorded.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0].body["model"], "gpt-test");
+        assert_eq!(seen[0].body["prompt_cache_key"], "agent_1:user_2");
+        // No key from the client: nothing is invented for the OpenAI API.
+        assert!(seen[1].body.get("prompt_cache_key").is_none());
+        // Any other OpenAI-compatible provider never receives the field.
+        assert_eq!(seen[2].body["model"], "mock-model");
+        assert!(seen[2].body.get("prompt_cache_key").is_none());
+        assert!(seen[3].body.get("prompt_cache_key").is_none());
+        // The header belongs to the chatgpt route only.
+        assert!(seen.iter().all(|request| request.session_id.is_none()));
+        assert!(seen.iter().all(|request| request.path == "/chat/completions"));
+    }
+
+    #[tokio::test]
+    async fn invalid_prompt_cache_key_is_a_400_on_every_route_before_any_upstream_call() {
+        let (gateway, recorded, _token_file) = spawn_recording_gateway().await;
+        let too_long = "k".repeat(crate::types::MAX_PROMPT_CACHE_KEY_LEN + 1);
+        for model in ["chatgpt/gpt-test", "openai/gpt-test", "mock-model"] {
+            for key in [json!(42), json!(""), json!(too_long), json!("line\nbreak"), json!("schlüssel")] {
+                let response = post_chat(
+                    gateway,
+                    json!({
+                        "model": model,
+                        "prompt_cache_key": key,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST, "{model} {key}");
+                let error: serde_json::Value = response.json().await.unwrap();
+                let message = error["error"]["message"].as_str().unwrap();
+                assert!(message.contains("prompt_cache_key"), "{message}");
+            }
+        }
+        assert!(recorded.lock().unwrap().is_empty());
     }
 
     #[test]

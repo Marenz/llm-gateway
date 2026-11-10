@@ -35,6 +35,44 @@ pub struct OpenAIRequest {
     pub response_format: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Client-chosen cache routing key. Kept as raw JSON so a wrong type is a
+    /// gateway 400 (see `client_prompt_cache_key`) rather than a serde 422.
+    /// Only the chatgpt and openai routes send it upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<serde_json::Value>,
+}
+
+/// Longest accepted client `prompt_cache_key`, in bytes.
+pub const MAX_PROMPT_CACHE_KEY_LEN: usize = 64;
+
+impl OpenAIRequest {
+    /// The validated client `prompt_cache_key`, if one was sent.
+    ///
+    /// The key is also used as an HTTP header value on the chatgpt route, so it
+    /// is restricted to printable ASCII without surrounding whitespace.
+    pub fn client_prompt_cache_key(&self) -> Result<Option<&str>, String> {
+        let Some(value) = &self.prompt_cache_key else {
+            return Ok(None);
+        };
+        let Some(key) = value.as_str() else {
+            return Err("prompt_cache_key must be a string".to_string());
+        };
+        if key.is_empty() {
+            return Err("prompt_cache_key must not be empty".to_string());
+        }
+        if key.len() > MAX_PROMPT_CACHE_KEY_LEN {
+            return Err(format!(
+                "prompt_cache_key must be at most {MAX_PROMPT_CACHE_KEY_LEN} characters"
+            ));
+        }
+        if !key.chars().all(|c| c.is_ascii_graphic() || c == ' ') || key.trim() != key {
+            return Err(
+                "prompt_cache_key must be printable ASCII without leading or trailing whitespace"
+                    .to_string(),
+            );
+        }
+        Ok(Some(key))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,5 +552,55 @@ mod tests {
         assert!(message.cache_control.is_none());
         assert!(usage.cache_creation_input_tokens.is_none());
         assert!(usage.cache_read_input_tokens.is_none());
+    }
+
+    fn request_with_key(key: serde_json::Value) -> super::OpenAIRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": key
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn prompt_cache_key_is_optional_and_null_means_absent() {
+        let absent: super::OpenAIRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert_eq!(absent.client_prompt_cache_key(), Ok(None));
+        assert!(serde_json::to_value(&absent).unwrap().get("prompt_cache_key").is_none());
+        assert_eq!(request_with_key(json!(null)).client_prompt_cache_key(), Ok(None));
+    }
+
+    #[test]
+    fn prompt_cache_key_accepts_printable_ascii_up_to_the_cap() {
+        let longest = "k".repeat(super::MAX_PROMPT_CACHE_KEY_LEN);
+        for key in ["agent_123_v1:user_456", "a b", longest.as_str()] {
+            let request = request_with_key(json!(key));
+            assert_eq!(request.client_prompt_cache_key(), Ok(Some(key)));
+        }
+    }
+
+    #[test]
+    fn prompt_cache_key_rejects_wrong_type_length_and_characters() {
+        let too_long = "k".repeat(super::MAX_PROMPT_CACHE_KEY_LEN + 1);
+        for key in [
+            json!(42),
+            json!({"key": "x"}),
+            json!(["x"]),
+            json!(""),
+            json!(too_long),
+            json!(" padded"),
+            json!("padded "),
+            json!("line\nbreak"),
+            json!("tab\tinside"),
+            json!("schlüssel"),
+        ] {
+            let request = request_with_key(key.clone());
+            assert!(request.client_prompt_cache_key().is_err(), "accepted {key}");
+        }
     }
 }

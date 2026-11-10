@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::types::{OpenAIMessageContent, OpenAIRequest, OpenAIRole};
 
@@ -114,6 +115,46 @@ pub fn to_responses_request(req: &OpenAIRequest) -> Value {
     }
 
     body
+}
+
+/// Set the cache routing key on a finished Responses request body and return
+/// it, so the caller can send the same value as the `session-id` header.
+///
+/// The ChatGPT backend only reuses a cached prefix when requests carry a stable
+/// identity: without `session-id` (and, less so, `prompt_cache_key`) every
+/// request reports `cached_tokens: 0`. Call this after the upstream model has
+/// been written to `body`, because the model is part of a derived key.
+///
+/// The key is a routing hint only and never alters `instructions` or `input`.
+pub fn apply_prompt_cache_key(body: &mut Value, client_key: Option<&str>) -> String {
+    let key = match client_key {
+        Some(key) => key.to_string(),
+        None => derive_prompt_cache_key(body),
+    };
+    body["prompt_cache_key"] = Value::String(key.clone());
+    key
+}
+
+/// Derive a key that identifies a conversation: the same model, instructions
+/// and first input item give the same key however many turns follow, and a
+/// change in any of them gives a different one.
+///
+/// Formatted as a UUID because that is what the Codex CLI sends in both places.
+fn derive_prompt_cache_key(body: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"llm-gateway/chatgpt-prompt-cache-key/v1");
+    let first_input = body.get("input").and_then(|input| input.get(0));
+    for part in [body.get("model"), body.get("instructions"), first_input] {
+        // JSON text is self-delimiting; the NUL keeps an absent part distinct.
+        hasher.update([0]);
+        if let Some(part) = part {
+            serde_json::to_writer(&mut hasher, part).expect("hashing JSON cannot fail");
+        }
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid().to_string()
 }
 
 fn build_input(messages: &[crate::types::OpenAIMessage]) -> Value {
@@ -545,6 +586,10 @@ fn translate_event(
 }
 
 pub fn apply_usage(state: &mut ChatgptStreamState, usage: &Value) {
+    // The raw counters are the only place upstream `cache_write_tokens` shows.
+    if let Some(details) = usage.get("input_tokens_details") {
+        tracing::debug!(input_tokens_details = %details, "chatgpt upstream usage");
+    }
     state.input_tokens = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
@@ -593,7 +638,76 @@ fn now_unix() -> u64 {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{ChatgptStreamState, translate_stream_event};
+    use super::{
+        ChatgptStreamState, apply_prompt_cache_key, to_responses_request, translate_stream_event,
+    };
+    use crate::types::OpenAIRequest;
+
+    fn responses_body(model: &str, messages: Value) -> Value {
+        let request: OpenAIRequest =
+            serde_json::from_value(json!({"model": model, "messages": messages})).unwrap();
+        to_responses_request(&request)
+    }
+
+    fn derived_key(model: &str, messages: Value) -> String {
+        apply_prompt_cache_key(&mut responses_body(model, messages), None)
+    }
+
+    #[test]
+    fn client_cache_key_is_used_verbatim() {
+        let mut body = responses_body("m", json!([{"role": "user", "content": "hello"}]));
+        let before = body.clone();
+        let key = apply_prompt_cache_key(&mut body, Some("agent_1:user_2"));
+
+        assert_eq!(key, "agent_1:user_2");
+        assert_eq!(body["prompt_cache_key"], "agent_1:user_2");
+        body.as_object_mut().unwrap().remove("prompt_cache_key");
+        assert_eq!(body, before, "only the key field is added");
+    }
+
+    #[test]
+    fn derived_cache_key_is_a_stable_uuid_for_a_growing_conversation() {
+        let system = json!({"role": "system", "content": "be brief"});
+        let first = json!({"role": "user", "content": "first question"});
+        let turn_1 = json!([system, first]);
+        let turn_2 = json!([system, first,
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"}]);
+        let turn_3 = json!([system, first,
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            {"role": "user", "content": "third question"}]);
+
+        let key = derived_key("m", turn_1.clone());
+        assert_eq!(key.len(), 36);
+        assert!(uuid::Uuid::parse_str(&key).is_ok(), "{key}");
+        assert_eq!(key, derived_key("m", turn_1));
+        assert_eq!(key, derived_key("m", turn_2));
+        assert_eq!(key, derived_key("m", turn_3));
+    }
+
+    #[test]
+    fn derived_cache_key_differs_by_model_instructions_and_first_input() {
+        let conversation = |system: &str, first: &str| {
+            json!([{"role": "system", "content": system}, {"role": "user", "content": first}])
+        };
+        let base = derived_key("m", conversation("be brief", "first question"));
+
+        assert_ne!(base, derived_key("other", conversation("be brief", "first question")));
+        assert_ne!(base, derived_key("m", conversation("be verbose", "first question")));
+        assert_ne!(base, derived_key("m", conversation("be brief", "another question")));
+        // Text moving between the system prompt and the first message is a
+        // different conversation, not a hash collision.
+        assert_ne!(
+            derived_key("m", conversation("ab", "c")),
+            derived_key("m", conversation("a", "bc"))
+        );
+        // No input at all still yields a usable key.
+        let empty = derived_key("m", json!([{"role": "system", "content": "be brief"}]));
+        assert!(uuid::Uuid::parse_str(&empty).is_ok());
+        assert_ne!(base, empty);
+    }
 
     #[test]
     fn collected_response_shape_reports_cached_subset_without_double_counting() {
