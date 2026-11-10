@@ -160,10 +160,28 @@ curl -s http://127.0.0.1:4000/health   # {"status":"ok"}
 ### Prompt cache passthrough
 
 - OpenAI-shaped `message.cache_control` is an explicit Anthropic cache boundary.
-  Explicit boundaries replace the legacy last-three-message heuristic and are
-  applied only after adjacent same-role messages have been merged.
-- Anthropic permits at most four breakpoints. Empty text and thinking blocks are
-  not cacheable; text, image, tool-use, and tool-result blocks are cacheable.
+  Explicit boundaries replace the legacy last-three-message heuristic.
+- A boundary stays on the last content block of its SOURCE message. Adjacent
+  same-role messages (tool results, user messages) still merge into one
+  Anthropic message, but the marker is placed right after its own message is
+  merged, so later messages are appended behind it and stay outside the cached
+  prefix. One merged message can carry several block-level markers.
+  - Two consecutive unmarked assistant texts are still joined into one string;
+    a marked one becomes its own text block.
+  - A marked message with no content of its own (user `content: null`, empty
+    assistant) shares the block merged before it: same marker, one breakpoint;
+    a different `ttl` on that block is a 400. With nothing before it, it is a
+    400 as before.
+- Validated before any upstream call (400, and no virtual-model failover): at
+  most four breakpoints, counted per block; a `ttl: "1h"` boundary must not come
+  after a 5-minute one in prompt order (system text, then messages). Anthropic
+  rejects that order itself (`validate_ttl_order`, confirmed live 2026-11-10).
+- `src/translate/fixtures/anthropic_request_pins.json` pins the exact upstream
+  bytes for the shapes Adapsis sends (boundaries on system text and assistant
+  messages), for a boundary on the last message of a merged run, and for the
+  heuristic. `expected` was recorded at c4f0d36; change it only on purpose.
+- Empty text and thinking blocks are not cacheable; text, image, tool-use, and
+  tool-result blocks are cacheable.
 - Cache-validation 400s are client errors and must stop virtual-model failover;
   ordinary upstream provider errors retain the normal failover policy.
 - Anthropic `input_tokens` excludes cache-read and cache-creation tokens, so they
