@@ -172,6 +172,41 @@ curl -s http://127.0.0.1:4000/health   # {"status":"ok"}
   fields separately. ChatGPT `input_tokens_details.cached_tokens` is already
   included in `input_tokens`; expose it without adding it to prompt or total.
 
+### ChatGPT prompt cache key
+
+- The ChatGPT backend only reuses a cached prefix when requests carry a stable
+  identity. Measured 2026-11-10 on `gpt-6-astra`, follow-up requests 12 s
+  apart: neither field 0/4 hits, `prompt_cache_key` only 1/8, `session-id`
+  header only 6/8, both 7/8. The gateway sends both with the same value, as the
+  Codex CLI does (`codex-rs/core/src/client.rs`,
+  `codex-api/src/requests/headers.rs`).
+- `/v1/chat/completions` accepts an optional `prompt_cache_key`: a string of
+  1–64 printable ASCII characters without surrounding whitespace
+  (`OpenAIRequest::client_prompt_cache_key`, `MAX_PROMPT_CACHE_KEY_LEN`). The
+  field is raw JSON in the request type so a wrong type is a gateway 400, not a
+  serde 422. It is checked once in `chat_completions`, before any route.
+- chatgpt route: `chatgpt::apply_prompt_cache_key` uses the client key, or
+  derives a UUID-shaped key from SHA-256 over the upstream model, the
+  `instructions` and the first `input` item. A conversation keeps its key as it
+  grows; a different model, system text or first message gives another key. The
+  key is a routing hint and never changes `instructions` or `input`.
+- openai route: a client key is forwarded; none is invented. All other routes
+  drop the field in `openai_passthrough_request`, as before.
+- Hits are probabilistic, not guaranteed. Measured 2026-11-10 with the derived
+  key on 1.6k-token prefixes: 18 of 29 second requests hit after 12 s, and 15
+  of 26 single later reads hit (60 s 1/5, 4 min 1/2, 7 min 2/2, 20 min 4/7,
+  35 min 4/5, 65 min 3/5). There is no downward trend up to 65 minutes, so no
+  expiry was observed; the upper bound and whether a read extends the lifetime
+  are not measured. Batches of the same test varied from 1/3 to 9/9 at 12 s
+  with no clear relation to request rate.
+- Usage: upstream reports `input_tokens_details.cached_tokens` (a multiple of
+  128, inside `input_tokens`) and `cache_write_tokens`, which was 0 on every
+  request on this route. The gateway exposes only `cache_read_input_tokens`.
+  `RUST_LOG=llm_gateway::translate::chatgpt=debug` logs the raw details.
+- Conversations with the same model, system text and first message share a
+  derived key. Clients that start many conversations identically should send
+  their own per-conversation `prompt_cache_key`.
+
 ## Virtual Models (failover chains)
 
 A **virtual model** maps a single client-facing model name to an ordered list of
