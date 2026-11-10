@@ -772,6 +772,7 @@ fn default_config() -> config::GatewayConfig {
         model_aliases: Default::default(),
         virtual_models: Default::default(),
         log_level: config::LogLevel::Normal,
+        max_request_bytes: config::DEFAULT_MAX_REQUEST_BYTES,
     }
 }
 

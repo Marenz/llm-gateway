@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response, Sse};
@@ -48,6 +49,8 @@ pub struct AppState {
     pub master_key: Option<String>,
     /// Virtual model name -> ordered list of real target model names.
     pub virtual_models: std::collections::HashMap<String, Vec<String>>,
+    /// Maximum accepted request body size (bytes); see `GatewayConfig::max_request_bytes`.
+    pub max_request_bytes: usize,
 }
 
 /// Decision returned by [`classify_failover_status`]: whether to return the
@@ -153,15 +156,11 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
         model_resolver,
         master_key: config.master_key.clone(),
         virtual_models: config.virtual_models.clone(),
+        max_request_bytes: config.max_request_bytes,
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/messages", post(messages))
-        .route("/v1/models", get(models))
-        .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(state, auth_middleware));
+    info!(max_request_bytes = config.max_request_bytes, "request body limit");
+    let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
@@ -171,6 +170,42 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
     let _ = std::any::TypeId::of::<Sse<futures::stream::Empty<Result<axum::response::sse::Event, Infallible>>>>();
     serve(listener, app).await.context("server error")?;
     Ok(())
+}
+
+/// Build the HTTP router. The body limit replaces axum's 2 MB default on every
+/// request-body route; exceeding it yields a JSON 413 (see `body_rejection`).
+fn build_router(state: Arc<AppState>) -> Router {
+    let limit = state.max_request_bytes;
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
+        .route("/v1/models", get(models))
+        .layer(DefaultBodyLimit::max(limit))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+/// Map a JSON extractor rejection to a gateway error. Oversized bodies get a
+/// 413 that names the configured limit; other rejections keep their status.
+fn body_rejection(rejection: JsonRejection, limit: usize) -> Response {
+    let status = rejection.status();
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        warn!(max_request_bytes = limit, "request body exceeds limit");
+        let body = Json(json!({
+            "error": {
+                "message": format!(
+                    "request body exceeds the gateway limit of {limit} bytes ({:.1} MiB); \
+                     raise `max_request_bytes` in the gateway config to allow larger requests",
+                    limit as f64 / (1024.0 * 1024.0)
+                ),
+                "type": "request_too_large",
+                "max_request_bytes": limit
+            }
+        }));
+        return (status, body).into_response();
+    }
+    error_response(status, rejection.body_text())
 }
 
 async fn health() -> impl IntoResponse {
@@ -261,8 +296,12 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<OpenAIRequest>,
+    body: Result<Json<OpenAIRequest>, JsonRejection>,
 ) -> Response {
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => return body_rejection(rejection, state.max_request_bytes),
+    };
     let request_id = Uuid::new_v4().simple().to_string();
     let started_at = std::time::Instant::now();
 
@@ -609,8 +648,12 @@ async fn dispatch_resolved(
 async fn messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(mut req): Json<AnthropicRequest>,
+    body: Result<Json<AnthropicRequest>, JsonRejection>,
 ) -> Response {
+    let mut req = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => return body_rejection(rejection, state.max_request_bytes),
+    };
     let Some(provider) = state.anthropic_pool.active_provider() else {
         return error_response(StatusCode::BAD_GATEWAY, "anthropic provider not configured");
     };
@@ -1651,6 +1694,157 @@ impl OpenCodeGoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Request body limit ─────────────────────────────────────────────────
+
+    /// Mock OpenAI-compatible upstream that reports how many bytes the
+    /// forwarded request body had, so tests can prove the body went through.
+    async fn spawn_echo_upstream() -> std::net::SocketAddr {
+        async fn completions(body: Bytes) -> Json<serde_json::Value> {
+            Json(json!({
+                "id": "mock", "object": "chat.completion", "created": 0, "model": "mock-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": body.len(), "completion_tokens": 1, "total_tokens": body.len() + 1}
+            }))
+        }
+        let app = Router::new()
+            .route("/chat/completions", post(completions))
+            .layer(DefaultBodyLimit::disable());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { serve(listener, app).await.unwrap() });
+        address
+    }
+
+    /// Start the real gateway router on loopback with a mock upstream route.
+    async fn spawn_gateway(max_request_bytes: Option<usize>) -> std::net::SocketAddr {
+        let upstream = spawn_echo_upstream().await;
+        let mut value = json!({
+            "providers": [{
+                "type": "openai_compatible",
+                "name": "mock",
+                "api_base": format!("http://{upstream}"),
+                "models": ["mock-model"]
+            }]
+        });
+        if let Some(limit) = max_request_bytes {
+            value["max_request_bytes"] = json!(limit);
+        }
+        let config: GatewayConfig = serde_json::from_value(value).unwrap();
+        let mut providers = std::collections::HashMap::new();
+        if let ProviderConfig::OpenaiCompatible(cfg) = &config.providers[0] {
+            providers.insert(cfg.name.clone(), OpenAICompatProvider::new(cfg.clone()));
+        }
+        let state = Arc::new(AppState {
+            anthropic_pool: AnthropicPool::new(vec![]),
+            chatgpt: None,
+            openai_compat_providers: providers,
+            opencode_go: None,
+            zen: None,
+            deepseek: None,
+            deepinfra: None,
+            model_resolver: ModelResolver::from_config(&config),
+            master_key: None,
+            virtual_models: Default::default(),
+            max_request_bytes: config.max_request_bytes,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move { serve(listener, app).await.unwrap() });
+        address
+    }
+
+    /// A chat request whose serialized JSON body is at least `size` bytes.
+    fn padded_chat_body(size: usize) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "model": "mock-model",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "x".repeat(size)}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn default_request_limit_is_64_mib() {
+        let config: GatewayConfig = serde_json::from_str(r#"{"providers": []}"#).unwrap();
+        assert_eq!(config.max_request_bytes, 64 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn request_above_axum_default_2mb_is_forwarded() {
+        let gateway = spawn_gateway(None).await;
+        let body = padded_chat_body(2_200_000);
+        let response = reqwest::Client::new()
+            .post(format!("http://{gateway}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let completion: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(completion["choices"][0]["message"]["content"], "OK");
+        // The upstream saw the full multi-MB message.
+        assert!(completion["usage"]["prompt_tokens"].as_u64().unwrap() > 2_200_000);
+    }
+
+    #[tokio::test]
+    async fn request_above_configured_limit_gets_json_413() {
+        let limit = 1024 * 1024;
+        let gateway = spawn_gateway(Some(limit)).await;
+        for path in ["/v1/chat/completions", "/v1/messages"] {
+            let response = reqwest::Client::new()
+                .post(format!("http://{gateway}{path}"))
+                .header("content-type", "application/json")
+                .body(padded_chat_body(limit + 1))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            let error: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(error["error"]["type"], "request_too_large");
+            assert_eq!(error["error"]["max_request_bytes"], limit);
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(message.contains(&limit.to_string()), "{message}");
+            assert!(message.contains("max_request_bytes"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_request_above_limit_gets_json_413() {
+        // No Content-Length: the limit must still trip while streaming the body.
+        let limit = 64 * 1024;
+        let gateway = spawn_gateway(Some(limit)).await;
+        let body = padded_chat_body(limit * 2);
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            body.chunks(8192).map(|c| Ok(c.to_vec())).collect();
+        let response = reqwest::Client::new()
+            .post(format!("http://{gateway}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(reqwest::Body::wrap_stream(futures::stream::iter(chunks)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        let error: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(error["error"]["max_request_bytes"], limit);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_still_reports_client_error() {
+        let gateway = spawn_gateway(None).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{gateway}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(error["error"]["type"], "gateway_error");
+    }
 
     #[tokio::test]
     async fn virtual_tool_only_completion_is_reemitted_with_exact_calls_and_terminal() {

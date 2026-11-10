@@ -132,6 +132,19 @@ curl -s http://127.0.0.1:4000/health   # {"status":"ok"}
 | Moonshot AI | API key | `moonshot` |
 | Generic | API key + custom header | `openai_compatible` |
 
+### Request body limit
+
+- `max_request_bytes` (config, default 64 MiB = `DEFAULT_MAX_REQUEST_BYTES`)
+  replaces axum's implicit 2 MB `DefaultBodyLimit` on all routes via
+  `build_router`. Before this, bodies >2 MB (≈450k tokens) failed with
+  "Failed to buffer the request body: length limit exceeded".
+- Handlers take `Result<Json<T>, JsonRejection>`; `body_rejection` turns an
+  oversized body into a JSON 413 (`type: request_too_large`,
+  `max_request_bytes: <n>`). Other rejections keep their status, JSON-wrapped.
+- No other size caps exist on the path: upstream reqwest clients, response
+  buffering (`bytes()`, `to_bytes(usize::MAX)`) and the SSE decoder are
+  unbounded. reqwest clients have no total timeout either.
+
 ### Image inputs
 
 - `/v1/chat/completions` accepts OpenAI multipart user content with `image_url`

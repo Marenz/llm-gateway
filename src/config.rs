@@ -33,6 +33,19 @@ pub struct GatewayConfig {
     /// Log level: quiet, minimal, normal, verbose
     #[serde(default = "default_log_level")]
     pub log_level: LogLevel,
+
+    /// Maximum accepted request body size in bytes for every request-body
+    /// route (default: 64 MiB). Larger bodies are rejected with a JSON 413.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
+}
+
+/// Default request body limit: 64 MiB. Large enough for ~1M-token contexts
+/// with some base64 images; axum's own default (2 MB) is far too small.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
+fn default_max_request_bytes() -> usize {
+    DEFAULT_MAX_REQUEST_BYTES
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
